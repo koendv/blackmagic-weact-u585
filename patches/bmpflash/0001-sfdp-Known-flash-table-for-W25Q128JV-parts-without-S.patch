@@ -1,0 +1,79 @@
+From 139bdcff19337314b954028d59a2ae9ddef98722 Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 2 Nov 2026 07:58:26 +0100
+Subject: [PATCH] sfdp: Known-flash table for W25Q128JV parts without SFDP
+
+The Flash on the WeAct board reports JEDEC ID EF 40 18 (W25Q128JV-IQ/JQ)
+but returns 0xFF for the whole 256-byte SFDP area. Fast Read (0Bh), which
+uses the same framing as Read SFDP (opcode, 3 address bytes, 8 dummy
+clocks), reads correctly, so the command arrives as it should and the
+area is blank. The part also reads QE=0, where the datasheet has QE
+fixed at 1 for the -IQ/-JQ parts with this ID, so it is probably not a
+genuine W25Q128JV.
+
+Look the JEDEC ID up in a small table before reading SFDP: EF 40 18 and
+EF 70 18, 256 B pages, 4 KiB sectors erased with 0x20, 16 MiB. Other
+devices still go through SFDP.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/sfdp.cxx | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/sfdp.cxx b/src/sfdp.cxx
+index dd3cac2..70c5363 100644
+--- a/src/sfdp.cxx
++++ b/src/sfdp.cxx
+@@ -153,6 +153,38 @@ namespace bmpflash::sfdp
+ 		return true;
+ 	}
+ 
++	// Devices whose geometry is hardcoded by JEDEC ID rather than read from SFDP
++	struct knownFlash_t
++	{
++		uint8_t manufacturer;
++		uint8_t type;
++		uint8_t capacity;
++		std::string_view name;
++		spiFlash_t flash;
++	};
++
++	constexpr static std::array<knownFlash_t, 2U> knownFlashes
++	{{
++		// Winbond W25Q128JV-IQ/JQ: QE bit fixed at 1; 16MiB, 256B pages, 4KiB sectors erased with 0x20
++		{0xefU, 0x40U, 0x18U, "Winbond W25Q128JV"sv, {256U, 4_KiB, 0x20U, 16U * 1024U * 1024U}},
++		// Winbond W25Q128JV-IM/JM: QE bit 0 by default, same geometry, memory type ID 70h
++		{0xefU, 0x70U, 0x18U, "Winbond W25Q128JV-M"sv, {256U, 4_KiB, 0x20U, 16U * 1024U * 1024U}},
++	}};
++
++	std::optional<spiFlash_t> knownFlashFromID(const spiFlash::jedecID_t &chipID)
++	{
++		for (const auto &known : knownFlashes)
++		{
++			if (known.manufacturer == chipID.manufacturer && known.type == chipID.type &&
++				known.capacity == chipID.capacity)
++			{
++				console.info("Using built-in parameters for "sv, known.name);
++				return known.flash;
++			}
++		}
++		return std::nullopt;
++	}
++
+ 	std::optional<spiFlash_t> spiFlashFromID(const bmp_t &probe)
+ 	{
+ 		const auto chipID{probe.identifyFlash()};
+@@ -202,6 +234,10 @@ namespace bmpflash::sfdp
+ 
+ 	std::optional<spiFlash_t> read(const bmp_t &probe)
+ 	{
++		// Some devices (e.g. Winbond's) don't implement SFDP in the standard way, so check for known IDs first
++		if (const auto known{knownFlashFromID(probe.identifyFlash())}; known)
++			return known;
++
+ 		console.info("Reading SFDP data for device"sv);
+ 		sfdpHeader_t header{};
+ 		if (!sfdpRead(probe, sfdpHeaderAddress, header, false))
+-- 
+2.43.0
+

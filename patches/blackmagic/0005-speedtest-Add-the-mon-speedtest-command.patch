@@ -1,0 +1,257 @@
+From 1d6ef26d412170c44454dedf3518716cdb6f5af9 Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Thu, 3 Sep 2026 14:24:19 +0200
+Subject: [PATCH] speedtest: Add the mon speedtest command
+
+Backport of speedtest from blackmagic-rtthread (18e2b30b).
+
+`mon speedtest [COUNT [SIZE [ADDR]]]` (default 16 writes of 1024 bytes to
+the start of target RAM) times SWD/JTAG writes to target RAM and reports
+the throughput. The overwritten RAM is backed up beforehand, the written
+data is verified, and the RAM is restored afterwards.
+
+Firmware specific changes:
+- Timing uses the millisecond counter refined with the probe's SysTick
+  count, for microsecond resolution (RT-Thread ticks before); BMDA
+  falls back to milliseconds.
+- The firmware printf family has no 64-bit support, so results are
+  printed from 32-bit values and COUNT * SIZE must fit in 32 bits.
+- speedtest.c is built for the firmware and BMDA, as command.c, which
+  registers the command, is shared.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/command.c   |   2 +
+ src/meson.build |   1 +
+ src/speedtest.c | 172 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/speedtest.h |   7 ++
+ 4 files changed, 182 insertions(+)
+ create mode 100644 src/speedtest.c
+ create mode 100644 src/speedtest.h
+
+diff --git a/src/command.c b/src/command.c
+index e6d83fd..a29c13e 100644
+--- a/src/command.c
++++ b/src/command.c
+@@ -35,6 +35,7 @@
+ #include "morse.h"
+ #include "version.h"
+ #include "jtagtap.h"
++#include "speedtest.h"
+ 
+ #if CONFIG_BMDA == 0
+ #include "jtag_scan.h"
+@@ -164,6 +165,7 @@ static const command_s cmd_list[] = {
+ #if CONFIG_BMDA == 1
+ 	{"shutdown_bmda", cmd_shutdown_bmda, "Tell the BMDA server to shut down when the GDB connection closes"},
+ #endif
++	{"speedtest", cmd_speedtest, "Measure SWD/JTAG throughput: [COUNT [SIZE [ADDRESS]]]"},
+ 	{NULL, NULL, NULL},
+ };
+ 
+diff --git a/src/meson.build b/src/meson.build
+index f66d240..e778bdc 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -45,6 +45,7 @@ libbmd_core_sources = files(
+ 	'maths_utils.c',
+ 	'morse.c',
+ 	'remote.c',
++	'speedtest.c',
+ 	'timing.c',
+ )
+ 
+diff --git a/src/speedtest.c b/src/speedtest.c
+new file mode 100644
+index 0000000..cb407c7
+--- /dev/null
++++ b/src/speedtest.c
+@@ -0,0 +1,172 @@
++/*
++ * Measure SWD/JTAG throughput by timing writes of a buffer to target RAM.
++ */
++
++#include "general.h"
++#include "target.h"
++#include "target_internal.h"
++#include "gdb_packet.h"
++#include "platform.h"
++#include "speedtest.h"
++
++#include <inttypes.h>
++#include <stdlib.h>
++
++#if CONFIG_BMDA == 0 && !defined(NO_LIBOPENCM3)
++#include <libopencm3/cm3/systick.h>
++#endif
++
++#define SPEEDTEST_DEFAULT_SIZE  1024U /* bytes per write */
++#define SPEEDTEST_MAX_SIZE      4096U
++#define SPEEDTEST_DEFAULT_COUNT 16U
++
++/*
++ * Microseconds since boot. On the firmware the millisecond counter is refined with the SysTick
++ * count, so short runs are timed accurately; BMDA only has millisecond resolution.
++ */
++static uint64_t speedtest_time_us(void)
++{
++#if CONFIG_BMDA == 0 && !defined(NO_LIBOPENCM3)
++	uint32_t ms;
++	uint32_t ticks;
++	/* Re-read if the SysTick interrupt advanced the millisecond counter in between */
++	do {
++		ms = platform_time_ms();
++		ticks = STK_CVR;
++	} while (ms != platform_time_ms());
++	/* SysTick counts down from the reload value once per SYSTICKMS milliseconds */
++	const uint32_t reload = STK_RVR + 1U;
++	return (uint64_t)ms * 1000U + ((uint64_t)(reload - 1U - ticks) * 1000U * SYSTICKMS) / reload;
++#else
++	return (uint64_t)platform_time_ms() * 1000U;
++#endif
++}
++
++bool cmd_speedtest(target_s *const target, const int argc, const char **const argv)
++{
++	if (!target) {
++		gdb_out("not attached\n");
++		return false;
++	}
++
++	if (!target->ram) {
++		tc_printf(target, "no ram\n");
++		return false;
++	}
++
++	target_addr_t dest = target->ram->start;
++	uint32_t size = SPEEDTEST_DEFAULT_SIZE;
++	uint32_t count = SPEEDTEST_DEFAULT_COUNT;
++
++	if (argc > 4)
++		goto usage;
++
++	char *end = NULL;
++
++	if (argc >= 2) {
++		count = strtoul(argv[1], &end, 0);
++		if (!end || *end || count == 0U)
++			goto usage;
++	}
++
++	if (argc >= 3) {
++		size = strtoul(argv[2], &end, 0);
++		if (!end || *end || size == 0U || size > SPEEDTEST_MAX_SIZE)
++			goto usage;
++	}
++
++	if (argc >= 4) {
++		dest = (target_addr_t)strtoul(argv[3], &end, 0);
++		if (!end || *end)
++			goto usage;
++	}
++
++	/* The byte count is reported as a 32-bit number: the firmware printf has no 64-bit support */
++	if (count > UINT32_MAX / size) {
++		tc_printf(target, "count * size too large\n");
++		return false;
++	}
++	const uint32_t bytes = count * size;
++
++	bool in_ram = false;
++	for (const target_ram_s *ram = target->ram; ram; ram = ram->next) {
++		const target_addr_t ram_end = ram->start + (target_addr_t)ram->length;
++		if (dest >= ram->start && dest <= ram_end && size <= ram_end - dest) {
++			in_ram = true;
++			break;
++		}
++	}
++	if (!in_ram) {
++		tc_printf(target, "address not in target ram\n");
++		return false;
++	}
++
++	uint8_t *const buffer = malloc(2U * size);
++	if (!buffer) {
++		tc_printf(target, "malloc %" PRIu32 " bytes fail\n", 2U * size);
++		return false;
++	}
++
++	for (uint32_t i = 0; i < size; ++i)
++		buffer[i] = i & 0xffU;
++
++	/* Back up the target RAM the test overwrites */
++	if (target_mem32_read(target, buffer + size, dest, size)) {
++		tc_printf(target, "ram backup fail\n");
++		free(buffer);
++		return false;
++	}
++
++	tc_printf(target, "%" PRIu32 " times writing %" PRIu32 " bytes to 0x%08" PRIx32 "\n", count, size, (uint32_t)dest);
++
++	const uint64_t start_us = speedtest_time_us();
++	for (uint32_t i = 0; i < count; ++i) {
++		if (target_mem32_write(target, dest, buffer, size)) {
++			tc_printf(target, "write fail\n");
++			free(buffer);
++			return false;
++		}
++	}
++	const uint64_t end_us = speedtest_time_us();
++
++	if (target_mem32_read(target, buffer, dest, size)) {
++		tc_printf(target, "read fail\n");
++		free(buffer);
++		return false;
++	}
++
++	for (uint32_t i = 0; i < size; ++i) {
++		if (buffer[i] != (i & 0xffU)) {
++			tc_printf(target, "verify fail\n");
++			free(buffer);
++			return false;
++		}
++	}
++
++	if (target_mem32_write(target, dest, buffer + size, size)) {
++		tc_printf(target, "ram restore fail\n");
++		free(buffer);
++		return false;
++	}
++
++	free(buffer);
++
++	const uint64_t elapsed_us = end_us - start_us;
++	if (elapsed_us == 0U) {
++		tc_printf(target, "timing fail\n");
++		return false;
++	}
++
++	/* kB/s with two decimals, computed in 64 bits and printed as 32-bit numbers */
++	const uint64_t kbytes_per_sec_x100 = ((uint64_t)bytes * 1000000U * 100U) / (1024U * elapsed_us);
++	tc_printf(target, "%" PRIu32 " bytes in %" PRIu32 ".%03" PRIu32 " ms = %" PRIu32 ".%02" PRIu32 " kB/s\n", bytes,
++		(uint32_t)(elapsed_us / 1000U), (uint32_t)(elapsed_us % 1000U), (uint32_t)(kbytes_per_sec_x100 / 100U),
++		(uint32_t)(kbytes_per_sec_x100 % 100U));
++
++	return true;
++
++usage:
++	tc_printf(target, "usage: mon speedtest [COUNT [SIZE [ADDR]]]\ndefault: %u, %u, target ram start\n",
++		SPEEDTEST_DEFAULT_COUNT, SPEEDTEST_DEFAULT_SIZE);
++	return false;
++}
+diff --git a/src/speedtest.h b/src/speedtest.h
+new file mode 100644
+index 0000000..521c023
+--- /dev/null
++++ b/src/speedtest.h
+@@ -0,0 +1,7 @@
++#ifndef TARGET_SPEEDTEST_H
++#define TARGET_SPEEDTEST_H
++
++/* `mon speedtest` command handler */
++bool cmd_speedtest(target_s *target, int argc, const char **argv);
++
++#endif
+-- 
+2.43.0
+

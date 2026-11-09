@@ -1,0 +1,40 @@
+From 9936f5b6d98fff99f95495192a56d7e0dc98597e Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 9 Nov 2026 09:25:17 +0100
+Subject: [PATCH] provisionELF: Skip sections without file contents
+
+provision packed SHT_NOBITS sections (.bss) like any other: it gave
+them a flash address after the initialised data and copied whatever
+bytes follow in the ELF file. Programming such an image writes junk
+past the program, erases sectors the program does not use, and a
+large .bss (buffers, heap) can push the image past the end of Flash.
+
+Skip sections of type SHT_NOBITS: they occupy RAM only and are cleared
+by the target's startup code. The provisioning format is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/provisionELF.cxx | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/provisionELF.cxx b/src/provisionELF.cxx
+index bc14e7d..eb9eb9d 100644
+--- a/src/provisionELF.cxx
++++ b/src/provisionELF.cxx
+@@ -138,6 +138,13 @@ namespace bmpflash::elf
+ 			return true;
+ 		}
+ 
++		// Sections like .bss occupy memory but have no contents in the file, so there is nothing to program
++		if (sectHeader.type() == enums::sectionHeaderType_t::bss)
++		{
++			console.debug("Section has no contents in the file (SHT_NOBITS), skipping"sv);
++			return true;
++		}
++
+ 		flashSection_t flashSection{};
+ 		flashSection.offset = currentOffsetFrom(flashHeader);
+ 		flashSection.flashAddr = progHeader.physicalAddress() + (sectHeader.address() - progHeader.virtualAddress());
+-- 
+2.43.0
+

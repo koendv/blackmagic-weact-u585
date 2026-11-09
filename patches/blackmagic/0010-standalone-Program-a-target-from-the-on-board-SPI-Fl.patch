@@ -1,0 +1,829 @@
+From 2200ee86de9ee39d99c69419a1061ecb884cf5ba Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 9 Nov 2026 09:53:58 +0100
+Subject: [PATCH] standalone: Program a target from the on-board SPI Flash
+
+Standalone programming: a long press on the user key programs a target
+from an image that `bmpflash provision` stored in the probe's on-board
+SPI Flash, without a host. `monitor flasher info` lists the stored
+image, `monitor flasher write` programs from GDB.
+
+- The image is bmpflash's provisioning format: a 4KiB header ("BMPF",
+  CRC32 of the header block, section table) and per section its data.
+  The header CRC is checked; the section data carries no checksum.
+- Scans SWD, then JTAG, attaches to each target found (many drivers
+  only build their Flash map on attach) and programs the first one
+  whose Flash holds every section: erases all section ranges first
+  (sections can share a sector), writes, verifies by reading back,
+  resets and detaches. It does not check that the image was built for
+  that chip, as when programming by hand.
+- Runs only while no GDB session is attached to a target, and also
+  without a host connected (polled from the GDB wait loop). Everything
+  talking to the target runs inside TRY/CATCH, with its own target
+  controller so driver messages never wait for an absent GDB session.
+- The LED blinks fast while programming, stays on for 3s on success,
+  and blinks an error code on failure (2 no image, 3 no matching
+  target, 4 erase/write failed, 5 verify failed, 6 communication
+  error). A log goes to the AUX USB serial port, or to GDB.
+- New meson option standalone_support (default off, needs the
+  platform's key and LED hooks); enabled for weact-u585, where the key
+  is PA0 and the platform's LED macros give way during the blink codes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cross-file/weact-u585.ini           |   1 +
+ meson_options.txt                   |   6 +
+ src/command.c                       |   6 +
+ src/include/standalone.h            |  40 +++
+ src/meson.build                     |   8 +
+ src/platforms/common/stm32/gdb_if.c |   7 +
+ src/platforms/weact-u585/README.md  |  30 ++
+ src/platforms/weact-u585/platform.c |  23 ++
+ src/platforms/weact-u585/platform.h |  18 +-
+ src/standalone.c                    | 487 ++++++++++++++++++++++++++++
+ 10 files changed, 624 insertions(+), 2 deletions(-)
+ create mode 100644 src/include/standalone.h
+ create mode 100644 src/standalone.c
+
+diff --git a/cross-file/weact-u585.ini b/cross-file/weact-u585.ini
+index e9a1b38..0d27dcb 100644
+--- a/cross-file/weact-u585.ini
++++ b/cross-file/weact-u585.ini
+@@ -22,4 +22,5 @@ probe = 'weact-u585'
+ targets = 'cortexar,cortexm,riscv32,riscv64,apollo3,at32f4,ch32,ch32v,ch579,efm,gd32,hc32,lattice,lpc,mm32,nrf,nxp,puya,renesas,rp,sam,stm,ti,xilinx'
+ rtt_support = true
+ bmd_bootloader = false
++standalone_support = true
+ enable_riscv_accel = true
+diff --git a/meson_options.txt b/meson_options.txt
+index e3a24fa..a5ed37a 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -81,6 +81,12 @@ option(
+ 	type: 'string',
+ 	description: 'RTT (Real Time Transfer) identifier string'
+ )
++option(
++	'standalone_support',
++	type: 'boolean',
++	value: false,
++	description: 'Enable standalone programming from the on-board SPI Flash (needs platform support)'
++)
+ option(
+ 	'memwatch_support',
+ 	type: 'boolean',
+diff --git a/src/command.c b/src/command.c
+index a29c13e..59fd3db 100644
+--- a/src/command.c
++++ b/src/command.c
+@@ -36,6 +36,9 @@
+ #include "version.h"
+ #include "jtagtap.h"
+ #include "speedtest.h"
++#ifdef ENABLE_STANDALONE
++#include "standalone.h"
++#endif
+ 
+ #if CONFIG_BMDA == 0
+ #include "jtag_scan.h"
+@@ -166,6 +169,9 @@ static const command_s cmd_list[] = {
+ 	{"shutdown_bmda", cmd_shutdown_bmda, "Tell the BMDA server to shut down when the GDB connection closes"},
+ #endif
+ 	{"speedtest", cmd_speedtest, "Measure SWD/JTAG throughput: [COUNT [SIZE [ADDRESS]]]"},
++#ifdef ENABLE_STANDALONE
++	{"flasher", cmd_standalone, "Program a target from the image in the on-board SPI Flash: [info|write]"},
++#endif
+ 	{NULL, NULL, NULL},
+ };
+ 
+diff --git a/src/include/standalone.h b/src/include/standalone.h
+new file mode 100644
+index 0000000..50a061c
+--- /dev/null
++++ b/src/include/standalone.h
+@@ -0,0 +1,40 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef INCLUDE_STANDALONE_H
++#define INCLUDE_STANDALONE_H
++
++#include <stdbool.h>
++
++#include "target.h"
++
++/* Called while waiting for GDB: starts standalone programming on a long press of the user key */
++void standalone_poll(void);
++
++/* `monitor flasher [info|write]` */
++bool cmd_standalone(target_s *target, int argc, const char **argv);
++
++/* Platform hooks */
++bool platform_standalone_key_pressed(void);
++/* Take over the status LED and switch it on or off */
++void platform_standalone_led(bool on);
++/* Give the status LED back to its normal functions */
++void platform_standalone_led_release(void);
++
++#endif /* INCLUDE_STANDALONE_H */
+diff --git a/src/meson.build b/src/meson.build
+index e778bdc..e9ab078 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -80,6 +80,13 @@ if rtt_support
+ 	endif
+ endif
+ 
++# Standalone programming support handling (firmware only, needs the platform's key/LED hooks)
++standalone_support = get_option('standalone_support')
++if standalone_support
++	bmd_core_sources += files('standalone.c')
++	bmd_core_args += ['-DENABLE_STANDALONE=1']
++endif
++
+ # Memwatch support handling (firmware only, the output goes to the AUX USB serial port)
+ memwatch_support = get_option('memwatch_support')
+ if memwatch_support
+@@ -133,6 +140,7 @@ summary(
+ 		'Debug output': debug_output,
+ 		'RTT support': rtt_support,
+ 		'Memwatch support': memwatch_support,
++		'Standalone programming': standalone_support,
+ 		'RVSWD support': rvswd_support,
+ 		'Advertise QStartNoAckMode': advertise_noackmode,
+ 	},
+diff --git a/src/platforms/common/stm32/gdb_if.c b/src/platforms/common/stm32/gdb_if.c
+index 2edfe2c..c06823a 100644
+--- a/src/platforms/common/stm32/gdb_if.c
++++ b/src/platforms/common/stm32/gdb_if.c
+@@ -30,6 +30,9 @@
+ #include "platform.h"
+ #include "usb_serial.h"
+ #include "gdb_if.h"
++#ifdef ENABLE_STANDALONE
++#include "standalone.h"
++#endif
+ 
+ #include <stdatomic.h>
+ 
+@@ -121,6 +124,10 @@ static void gdb_if_update_buf(void)
+ char gdb_if_getchar(void)
+ {
+ 	while (gdb_receive_index >= gdb_receive_amount_available) {
++#ifdef ENABLE_STANDALONE
++		/* Waiting for GDB, with or without a host connected: check the user key */
++		standalone_poll();
++#endif
+ 		/*
+ 		 * Detach if port closed
+ 		 *
+diff --git a/src/platforms/weact-u585/README.md b/src/platforms/weact-u585/README.md
+index a45531b..1023fa6 100644
+--- a/src/platforms/weact-u585/README.md
++++ b/src/platforms/weact-u585/README.md
+@@ -41,6 +41,35 @@ With both failed, the HSE blinks come first, then the LSE blinks. Debug builds (
+ also log a warning. `monitor clocks` shows whether the crystals run, and where SYSCLK and the USB clock
+ come from.
+ 
++## Standalone programming
++
++With a SPI Flash chip soldered to the U3 footprint (e.g. W25Q128JVSIQ), the probe can program a target
++without a host:
++
++1. Store an image: `bmpflash provision firmware.elf` (an ARM ELF file).
++2. Connect the target (SWD or JTAG).
++3. Press and hold KEY for about one second.
++
++The probe scans SWD, then JTAG, attaches to each target found and programs the first one whose Flash holds
++every section of the image: it erases the sections' Flash, writes them, verifies them by reading them back,
++then resets the target. It does not check that the image was built for that chip; that is up to the
++operator, as when programming by hand.
++
++The LED blinks fast while programming, then stays on for 3 seconds on success. On failure it blinks an error
++code three times:
++
++| Blinks | Meaning                                                    |
++| ------ | ---------------------------------------------------------- |
++| 2      | No valid image in the SPI Flash                            |
++| 3      | No target found, or no target's Flash holds the image      |
++| 4      | Erasing or writing the target's Flash failed               |
++| 5      | Verify failed: the target's Flash does not match the image |
++| 6      | Communication with the target failed                       |
++
++A log goes to the second USB serial port. `monitor flasher info` lists the stored image, and
++`monitor flasher write` programs from GDB, with the log in GDB. The key is ignored while GDB is attached to
++a target.
++
+ ## Pinout
+ 
+ | Function    | Pin  | Notes                                  |
+@@ -55,6 +84,7 @@ come from.
+ | UART2 TX/RX | PA9/PA10  | USART1                            |
+ | USB D-/D+   | PA11/PA12 | no VBUS sense                     |
+ | LED         | PC13 | active low                             |
++| KEY         | PA0  | active low, long press: standalone programming |
+ | Flash nCS/CLK/DO/DI | PA4/PA5/PA6/PA7 | SPI1, U3 footprint |
+ | HSE         | PH0/PH1   | 25MHz crystal                     |
+ | LSE         | PC14/PC15 | 32.768kHz crystal                 |
+diff --git a/src/platforms/weact-u585/platform.c b/src/platforms/weact-u585/platform.c
+index 887a382..408593c 100644
+--- a/src/platforms/weact-u585/platform.c
++++ b/src/platforms/weact-u585/platform.c
+@@ -95,6 +95,8 @@ static volatile uint32_t magic[2] __attribute__((section(".noinit")));
+ /* Whether the HSE crystal started at boot, and so whether SYSCLK runs from it */
+ static bool hse_ok = false;
+ 
++bool platform_led_override = false;
++
+ static bool cmd_clocks(target_s *target, int argc, const char **argv);
+ 
+ const command_s platform_cmd_list[] = {
+@@ -293,6 +295,9 @@ static void gpio_init(void)
+ 	gpio_set_output_options(NRST_PORT, GPIO_OTYPE_OD, GPIO_OSPEED_25MHZ, NRST_PIN);
+ 	gpio_mode_setup(NRST_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, NRST_PIN);
+ 
++	/* The user key connects PA0 to GND through 330R: read it active low with the internal pull-up */
++	gpio_mode_setup(KEY_PORT, GPIO_MODE_INPUT, GPIO_PUPD_PULLUP, KEY_PIN);
++
+ 	/* Configure the pin used to drive the user LED (PC13, active low), starting off */
+ 	gpio_set(LED0_PORT, LED0_PIN);
+ 	gpio_set_output_options(LED0_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, LED0_PIN);
+@@ -342,6 +347,24 @@ static bool cmd_clocks(target_s *const target, const int argc, const char **cons
+ 	return true;
+ }
+ 
++/* Standalone programming hooks: the user key, and the LED for progress and result codes */
++bool platform_standalone_key_pressed(void)
++{
++	return !gpio_get(KEY_PORT, KEY_PIN);
++}
++
++void platform_standalone_led(const bool on)
++{
++	platform_led_override = true;
++	gpio_set_val(LED0_PORT, LED0_PIN, !on); /* active low */
++}
++
++void platform_standalone_led_release(void)
++{
++	platform_led_override = false;
++	SET_IDLE_STATE(true);
++}
++
+ int platform_hwversion(void)
+ {
+ 	return 0;
+diff --git a/src/platforms/weact-u585/platform.h b/src/platforms/weact-u585/platform.h
+index c070ffd..cc08be1 100644
+--- a/src/platforms/weact-u585/platform.h
++++ b/src/platforms/weact-u585/platform.h
+@@ -59,6 +59,7 @@ extern bool debug_bmp;
+  * Host Interface & Misc:
+  * USB_D+    = PA12
+  * USB_D-    = PA11
++ * KEY       = PA0  (User key to GND via 330R, active low: long press for standalone programming)
+  * HSE       = PH0/PH1   (25MHz crystal, clocks SYSCLK through PLL1)
+  * LSE       = PC14/PC15 (32.768kHz crystal)
+  *
+@@ -130,6 +131,9 @@ extern bool debug_bmp;
+ #define USB_DP_PIN GPIO12
+ #define USB_DM_PIN GPIO11
+ 
++#define KEY_PORT GPIOA
++#define KEY_PIN  GPIO0
++
+ #define LED0_PORT         GPIOC
+ #define LED0_PIN          GPIO13
+ #define LED_UART_PORT     LED0_PORT
+@@ -250,7 +254,17 @@ extern bool debug_bmp;
+ 
+ #define SET_RUN_STATE(state) running_status = (state)
+ /* PC13 is active low, so invert the LED states */
+-#define SET_IDLE_STATE(state)  gpio_set_val(LED_IDLE_RUN_PORT, LED_IDLE_RUN_PIN, !(state))
+-#define SET_ERROR_STATE(state) gpio_set_val(LED_ERROR_PORT, LED_ERROR_PIN, !(state))
++/* Set while standalone programming drives the LED, so the idle/error indications leave it alone */
++extern bool platform_led_override;
++#define SET_IDLE_STATE(state)                                                   \
++	do {                                                                        \
++		if (!platform_led_override)                                             \
++			gpio_set_val(LED_IDLE_RUN_PORT, LED_IDLE_RUN_PIN, !(state));        \
++	} while (0)
++#define SET_ERROR_STATE(state)                                                  \
++	do {                                                                        \
++		if (!platform_led_override)                                             \
++			gpio_set_val(LED_ERROR_PORT, LED_ERROR_PIN, !(state));              \
++	} while (0)
+ 
+ #endif /* PLATFORMS_WEACT_U585_PLATFORM_H */
+diff --git a/src/standalone.c b/src/standalone.c
+new file mode 100644
+index 0000000..097ad20
+--- /dev/null
++++ b/src/standalone.c
+@@ -0,0 +1,487 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Standalone programming: program a target from an image that `bmpflash provision` stored in the probe's
++ * on-board SPI Flash, without a host. Started by a long press on the user key, or by
++ * `monitor flasher write`.
++ *
++ * The image format is bmpflash's: the first 4KiB block of the SPI Flash holds the header, "BMPF", a CRC32
++ * of the whole block (computed with the CRC field set to 0xffffffff), the section count, then per section
++ * 16 bytes: offset in the SPI Flash, length and (64-bit) target address, all little endian.
++ *
++ * Programming scans SWD, then JTAG, attaches to each target found in turn (many target drivers only build
++ * their Flash map on attach) and programs the first one whose Flash holds every section: it erases all the
++ * section ranges, writes the sections, verifies them by reading them back, then resets and detaches.
++ */
++
++#include "general.h"
++#include "target.h"
++#include "target_internal.h"
++#include "gdb_main.h"
++#include "gdb_packet.h"
++#include "exception.h"
++#include "platform.h"
++#include "spi.h"
++#include "standalone.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define STANDALONE_HEADER_SIZE   4096U
++#define STANDALONE_HEADER_FIXED  12U
++#define STANDALONE_SECTION_SIZE  16U
++#define STANDALONE_MAX_SECTIONS  ((STANDALONE_HEADER_SIZE - STANDALONE_HEADER_FIXED) / STANDALONE_SECTION_SIZE)
++#define STANDALONE_CHUNK_SIZE    1024U
++#define STANDALONE_LONG_PRESS_MS 1000U
++#define STANDALONE_BLINK_MS      100U
++
++/* The result of a programming run; the error values are also the number of LED blinks */
++typedef enum standalone_result {
++	standalone_ok = 0,
++	standalone_err_image = 2,   /* no valid image in the SPI Flash */
++	standalone_err_target = 3,  /* no target, or not exactly one target whose Flash holds the image */
++	standalone_err_program = 4, /* erasing or writing the target's Flash failed */
++	standalone_err_verify = 5,  /* the target's Flash does not match the image */
++	standalone_err_comms = 6,   /* communication with the target failed */
++} standalone_result_e;
++
++typedef struct standalone_section {
++	uint32_t offset;
++	uint32_t length;
++	uint32_t address;
++} standalone_section_s;
++
++/* Whether output goes to GDB (monitor command) or to the AUX serial port (user key) */
++static bool standalone_via_gdb = false;
++static uint32_t standalone_led_toggled_ms = 0U;
++static bool standalone_led_on = false;
++
++static void standalone_output(const char *const buf, int len)
++{
++	if (len <= 0)
++		return;
++	if (standalone_via_gdb)
++		gdb_out(buf);
++	else {
++		debug_serial_send_stdout((const uint8_t *)buf, (size_t)len);
++		/* debug_serial_send_stdout() drops data while the previous USB packet is pending */
++		platform_delay(2U);
++	}
++}
++
++static void standalone_vlog(const char *const fmt, va_list args)
++{
++	char buf[96];
++	int len = vsnprintf(buf, sizeof(buf), fmt, args);
++	if (len >= (int)sizeof(buf))
++		len = (int)sizeof(buf) - 1;
++	standalone_output(buf, len);
++}
++
++static void standalone_log(const char *const fmt, ...)
++{
++	va_list args;
++	va_start(args, fmt);
++	standalone_vlog(fmt, args);
++	va_end(args);
++}
++
++/* Messages from the target drivers go to the same place, never to a GDB session that may not be there */
++static void standalone_tc_printf(target_controller_s *const controller, const char *const fmt, va_list args)
++{
++	(void)controller;
++	standalone_vlog(fmt, args);
++}
++
++static void standalone_tc_destroy(target_controller_s *const controller, target_s *const target)
++{
++	(void)controller;
++	(void)target;
++}
++
++static target_controller_s standalone_controller = {
++	.destroy_callback = standalone_tc_destroy,
++	.printf = standalone_tc_printf,
++};
++
++/* Fast LED blinking shows programming is in progress */
++static void standalone_progress(void)
++{
++	const uint32_t now = platform_time_ms();
++	if (now - standalone_led_toggled_ms >= STANDALONE_BLINK_MS) {
++		standalone_led_toggled_ms = now;
++		standalone_led_on = !standalone_led_on;
++		platform_standalone_led(standalone_led_on);
++	}
++}
++
++static void standalone_show_result(const standalone_result_e result)
++{
++	if (result == standalone_ok) {
++		/* Success: the LED stays on for a while */
++		platform_standalone_led(true);
++		platform_delay(3000U);
++	} else {
++		/* Failure: the number of blinks gives the error, shown three times */
++		for (uint32_t repeat = 0U; repeat < 3U; ++repeat) {
++			for (uint32_t blink = 0U; blink < (uint32_t)result; ++blink) {
++				platform_standalone_led(true);
++				platform_delay(200U);
++				platform_standalone_led(false);
++				platform_delay(200U);
++			}
++			platform_delay(1000U);
++		}
++	}
++	platform_standalone_led_release();
++}
++
++static uint32_t standalone_read32(const uint8_t *const data)
++{
++	return (uint32_t)data[0] | ((uint32_t)data[1] << 8U) | ((uint32_t)data[2] << 16U) | ((uint32_t)data[3] << 24U);
++}
++
++/*
++ * The header CRC32: reflected polynomial 0xedb88320, final inversion, and a register starting at 0, as
++ * bmpflash inverts its 0xffffffff start value on entry. The CRC field counts as 0xffffffff.
++ */
++static uint32_t standalone_header_crc(const uint8_t *const header)
++{
++	uint32_t crc = 0U;
++	for (size_t idx = 0U; idx < STANDALONE_HEADER_SIZE; ++idx) {
++		crc ^= (idx >= 4U && idx < 8U) ? 0xffU : header[idx];
++		for (size_t bit = 0U; bit < 8U; ++bit)
++			crc = (crc >> 1U) ^ (0xedb88320U & (0U - (crc & 1U)));
++	}
++	return ~crc;
++}
++
++static standalone_section_s standalone_section(const uint8_t *const header, const uint32_t index)
++{
++	const uint8_t *const entry = header + STANDALONE_HEADER_FIXED + (index * STANDALONE_SECTION_SIZE);
++	const standalone_section_s section = {
++		.offset = standalone_read32(entry),
++		.length = standalone_read32(entry + 4U),
++		.address = standalone_read32(entry + 8U),
++	};
++	return section;
++}
++
++static void standalone_spi_read(const uint32_t offset, void *const buffer, const size_t length)
++{
++	bmp_spi_read(SPI_BUS_INTERNAL, SPI_DEVICE_INT_FLASH, SPI_FLASH_CMD_PAGE_READ, offset, buffer, length);
++}
++
++/* Read the image header and check it; returns the section count, or 0 for no valid image */
++static uint32_t standalone_read_image(uint8_t *const header)
++{
++	standalone_spi_read(0U, header, STANDALONE_HEADER_SIZE);
++	if (memcmp(header, "BMPF", 4U) != 0) {
++		standalone_log("No image in the SPI Flash (use bmpflash provision)\n");
++		return 0U;
++	}
++	if (standalone_read32(header + 4U) != standalone_header_crc(header)) {
++		standalone_log("Image header CRC mismatch\n");
++		return 0U;
++	}
++	const uint32_t count = standalone_read32(header + 8U);
++	if (count == 0U || count > STANDALONE_MAX_SECTIONS) {
++		standalone_log("Invalid section count %" PRIu32 "\n", count);
++		return 0U;
++	}
++	for (uint32_t idx = 0U; idx < count; ++idx) {
++		const standalone_section_s section = standalone_section(header, idx);
++		const uint8_t *const entry = header + STANDALONE_HEADER_FIXED + (idx * STANDALONE_SECTION_SIZE);
++		/* The target address is 64 bits wide in the image; only 32-bit targets are supported */
++		if (section.offset < STANDALONE_HEADER_SIZE || section.length == 0U || standalone_read32(entry + 12U) != 0U ||
++			section.address + section.length < section.address) {
++			standalone_log("Invalid section %" PRIu32 "\n", idx);
++			return 0U;
++		}
++	}
++	return count;
++}
++
++static bool standalone_target_holds_image(target_s *const target, const uint8_t *const header, const uint32_t count)
++{
++	for (uint32_t idx = 0U; idx < count; ++idx) {
++		const standalone_section_s section = standalone_section(header, idx);
++		if (!target_flash_for_addr(target, section.address) ||
++			!target_flash_for_addr(target, section.address + section.length - 1U)) {
++			standalone_log("%s: section %" PRIu32 " at 0x%08" PRIx32 " is not in its Flash\n", target->driver, idx,
++				section.address);
++			return false;
++		}
++	}
++	return true;
++}
++
++static void standalone_count_target(const size_t index, target_s *const target, void *const context)
++{
++	(void)index;
++	(void)target;
++	++*(size_t *)context;
++}
++
++/* Scan SWD first, then JTAG; returns true if targets were found */
++static bool standalone_scan(void)
++{
++	/* volatile: changed inside TRY blocks, which use setjmp/longjmp */
++	volatile bool found = false;
++	{
++		TRY (EXCEPTION_ALL) {
++			found = adiv5_swd_scan();
++		}
++		CATCH () {
++		default:
++			found = false;
++			break;
++		}
++	}
++	if (found)
++		return true;
++	{
++		TRY (EXCEPTION_ALL) {
++			found = jtag_scan();
++		}
++		CATCH () {
++		default:
++			found = false;
++			break;
++		}
++	}
++	return found;
++}
++
++static standalone_result_e standalone_write_target(
++	target_s *const target, const uint8_t *const header, const uint32_t count, uint8_t *const buffer)
++{
++	/* Erase every section range before writing anything: sections can share a Flash sector */
++	for (uint32_t idx = 0U; idx < count; ++idx) {
++		const standalone_section_s section = standalone_section(header, idx);
++		standalone_progress();
++		if (!target_flash_erase(target, section.address, section.length)) {
++			standalone_log("Erase failed at 0x%08" PRIx32 "\n", section.address);
++			return standalone_err_program;
++		}
++	}
++
++	for (uint32_t idx = 0U; idx < count; ++idx) {
++		const standalone_section_s section = standalone_section(header, idx);
++		for (uint32_t done = 0U; done < section.length; done += STANDALONE_CHUNK_SIZE) {
++			const uint32_t amount = MIN(section.length - done, STANDALONE_CHUNK_SIZE);
++			standalone_progress();
++			standalone_spi_read(section.offset + done, buffer, amount);
++			if (!target_flash_write(target, section.address + done, buffer, amount)) {
++				standalone_log("Write failed at 0x%08" PRIx32 "\n", section.address + done);
++				return standalone_err_program;
++			}
++		}
++	}
++	if (!target_flash_complete(target)) {
++		standalone_log("Write failed\n");
++		return standalone_err_program;
++	}
++
++	/* Verify by reading every section back */
++	uint8_t *const readback = buffer + STANDALONE_CHUNK_SIZE;
++	for (uint32_t idx = 0U; idx < count; ++idx) {
++		const standalone_section_s section = standalone_section(header, idx);
++		for (uint32_t done = 0U; done < section.length; done += STANDALONE_CHUNK_SIZE) {
++			const uint32_t amount = MIN(section.length - done, STANDALONE_CHUNK_SIZE);
++			standalone_progress();
++			standalone_spi_read(section.offset + done, buffer, amount);
++			if (target_mem32_read(target, readback, section.address + done, amount) ||
++				memcmp(buffer, readback, amount) != 0) {
++				standalone_log("Verify failed at 0x%08" PRIx32 "\n", section.address + done);
++				return standalone_err_verify;
++			}
++		}
++	}
++	return standalone_ok;
++}
++
++/*
++ * Attach to target number `number` (counting from 1) and, if its Flash holds the image, program it.
++ * `*selected` tells whether this target was the one to program; if not, the result is meaningless.
++ */
++static standalone_result_e standalone_program_target(const size_t number, const uint8_t *const header,
++	const uint32_t count, uint8_t *const buffer, bool *const selected)
++{
++	/* volatile: changed inside TRY blocks, which use setjmp/longjmp */
++	volatile standalone_result_e result = standalone_err_target;
++	volatile bool holds_image = false;
++	target_s *volatile target = NULL;
++	{
++		TRY (EXCEPTION_ALL) {
++			target = target_attach_n(number, &standalone_controller);
++			if (!target)
++				standalone_log("Target %u: attach failed\n", (unsigned)number);
++			/* Many target drivers only build their Flash map on attach, so check it now */
++			if (target && standalone_target_holds_image(target, header, count)) {
++				holds_image = true;
++				standalone_log("Programming %s\n", target->driver);
++				result = standalone_write_target(target, header, count, buffer);
++			}
++		}
++		CATCH () {
++		default:
++			standalone_log("Target %u: communication failed: %s\n", (unsigned)number,
++				exception_frame.msg ? exception_frame.msg : "unknown error");
++			result = standalone_err_comms;
++			break;
++		}
++	}
++	if (target) {
++		TRY (EXCEPTION_ALL) {
++			/* Start the new program */
++			if (holds_image && result == standalone_ok)
++				target_reset(target);
++			target_detach(target);
++		}
++		CATCH () {
++		default:
++			break;
++		}
++	}
++	*selected = holds_image;
++	return result;
++}
++
++static standalone_result_e standalone_program_image(uint8_t *const header, uint8_t *const buffer)
++{
++	const uint32_t count = standalone_read_image(header);
++	if (!count)
++		return standalone_err_image;
++	standalone_log("Image: %" PRIu32 " sections\n", count);
++
++	if (!standalone_scan()) {
++		standalone_log("No target found\n");
++		return standalone_err_target;
++	}
++	/* Program the first target whose Flash holds the image (cores of one chip share their Flash map) */
++	size_t targets = 0U;
++	target_foreach(standalone_count_target, &targets);
++	standalone_log("Found %u target%s\n", (unsigned)targets, targets == 1U ? "" : "s");
++	for (size_t number = 1U; number <= targets; ++number) {
++		bool selected = false;
++		const standalone_result_e result = standalone_program_target(number, header, count, buffer, &selected);
++		if (selected)
++			return result;
++	}
++	standalone_log("No target's Flash holds the image\n");
++	return standalone_err_target;
++}
++
++static standalone_result_e standalone_program(void)
++{
++	uint8_t *const header = malloc(STANDALONE_HEADER_SIZE);
++	uint8_t *const buffer = malloc(2U * STANDALONE_CHUNK_SIZE);
++	standalone_result_e result = standalone_err_image;
++	if (!header || !buffer)
++		standalone_log("Out of memory\n");
++	else if (!platform_spi_init(SPI_BUS_INTERNAL))
++		standalone_log("SPI Flash not available\n");
++	else {
++		result = standalone_program_image(header, buffer);
++		platform_spi_deinit(SPI_BUS_INTERNAL);
++	}
++	/* The scan replaced the target list; start any later GDB session from a clean state */
++	target_list_free();
++	free(buffer);
++	free(header);
++	standalone_log(result == standalone_ok ? "Programming done\n" : "Programming failed\n");
++	return result;
++}
++
++void standalone_poll(void)
++{
++	static uint32_t pressed_since = 0U;
++	/* The key must be released first, so holding it at power-up or after a run does nothing */
++	static bool released = false;
++
++	const bool pressed = platform_standalone_key_pressed();
++	if (!pressed) {
++		released = true;
++		pressed_since = 0U;
++		return;
++	}
++	/* Never while a GDB session is attached to a target */
++	if (!released || cur_target)
++		return;
++	const uint32_t now = platform_time_ms();
++	if (!pressed_since) {
++		pressed_since = now | 1U;
++		return;
++	}
++	if (now - pressed_since < STANDALONE_LONG_PRESS_MS)
++		return;
++
++	released = false;
++	pressed_since = 0U;
++	standalone_via_gdb = false;
++	standalone_led_toggled_ms = now;
++	standalone_led_on = false;
++	standalone_show_result(standalone_program());
++}
++
++static bool standalone_info(void)
++{
++	uint8_t *const header = malloc(STANDALONE_HEADER_SIZE);
++	bool result = false;
++	if (!header)
++		standalone_log("Out of memory\n");
++	else if (!platform_spi_init(SPI_BUS_INTERNAL))
++		standalone_log("SPI Flash not available\n");
++	else {
++		const uint32_t count = standalone_read_image(header);
++		for (uint32_t idx = 0U; idx < count; ++idx) {
++			const standalone_section_s section = standalone_section(header, idx);
++			standalone_log("%3" PRIu32 ": 0x%08" PRIx32 " %6" PRIu32 " bytes\n", idx, section.address, section.length);
++		}
++		result = count != 0U;
++		platform_spi_deinit(SPI_BUS_INTERNAL);
++	}
++	free(header);
++	return result;
++}
++
++bool cmd_standalone(target_s *const target, const int argc, const char **const argv)
++{
++	const bool write = argc == 2 && strcmp(argv[1], "write") == 0;
++	if (argc > 2 || (argc == 2 && !write && strcmp(argv[1], "info") != 0)) {
++		gdb_out("usage: monitor flasher [info|write]\n");
++		return false;
++	}
++	standalone_via_gdb = true;
++	if (!write)
++		return standalone_info();
++	if (target) {
++		gdb_out("Detach from the target first\n");
++		return false;
++	}
++	standalone_led_toggled_ms = platform_time_ms();
++	standalone_led_on = false;
++	const standalone_result_e result = standalone_program();
++	platform_standalone_led_release();
++	return result == standalone_ok;
++}
+-- 
+2.43.0
+

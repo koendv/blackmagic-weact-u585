@@ -1,0 +1,145 @@
+name: Build
+
+# Runs only by hand. Tick "release" and give a name to publish a release; set the refs to "main" to
+# check that the patches still apply to and build with upstream main.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish a GitHub release from this build'
+        type: boolean
+        default: false
+      release_name:
+        description: 'Release name and tag, e.g. v0.1 (required for a release)'
+        type: string
+        default: ''
+      bmd_ref:
+        description: 'blackmagic branch, tag or commit (empty = pinned in build.sh; no release)'
+        required: false
+        default: ''
+      libopencm3_ref:
+        description: 'libopencm3 branch, tag or commit (empty = pinned in build.sh; no release)'
+        required: false
+        default: ''
+      bmpflash_ref:
+        description: 'bmpflash branch, tag or commit (empty = pinned in build.sh; no release)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build firmware and bmpflash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Before building: a release needs a new, valid name and the upstream revisions pinned in build.sh
+      - name: Check release inputs
+        if: ${{ inputs.release }}
+        env:
+          RELEASE_NAME: ${{ inputs.release_name }}
+          BMD_REF: ${{ inputs.bmd_ref }}
+          LIBOPENCM3_REF: ${{ inputs.libopencm3_ref }}
+          BMPFLASH_REF: ${{ inputs.bmpflash_ref }}
+        run: |
+          if [ -z "$RELEASE_NAME" ]; then
+            echo "::error::A release needs a release name"
+            exit 1
+          fi
+          if ! git check-ref-format "refs/tags/$RELEASE_NAME"; then
+            echo "::error::'$RELEASE_NAME' is not a valid tag name"
+            exit 1
+          fi
+          if [ -n "$BMD_REF$LIBOPENCM3_REF$BMPFLASH_REF" ]; then
+            echo "::error::A release uses the upstream revisions pinned in build.sh; leave the refs empty"
+            exit 1
+          fi
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$RELEASE_NAME")" ]; then
+            echo "::error::Tag '$RELEASE_NAME' already exists"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the build environment image
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          tags: weact-u585-builder:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build
+        env:
+          # Empty means "use the revision pinned in build.sh"
+          BMD_REF: ${{ inputs.bmd_ref }}
+          LIBOPENCM3_REF: ${{ inputs.libopencm3_ref }}
+          BMPFLASH_REF: ${{ inputs.bmpflash_ref }}
+          # On a release, the version strings carry the release name instead of the commit hash
+          REPO_REV: ${{ inputs.release && inputs.release_name || '' }}
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env BMD_REF --env LIBOPENCM3_REF --env BMPFLASH_REF --env REPO_REV \
+            --volume "${GITHUB_WORKSPACE}:/src" \
+            --workdir /src \
+            weact-u585-builder:latest \
+            ./build.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: blackmagic-weact-u585
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release
+    if: ${{ inputs.release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: blackmagic-weact-u585
+          path: out
+
+      - name: Write release notes
+        run: |
+          {
+            echo "Black Magic Debug for the WeAct Black Pill STM32U585, built from ${GITHUB_SHA::7}."
+            echo
+            echo "Upstream revisions:"
+            echo
+            echo '```'
+            cat out/versions.txt
+            echo '```'
+          } > release-notes.md
+
+      # Creates the tag on the built commit
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_name }}
+          name: ${{ inputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          body_path: release-notes.md
+          files: out/*
+          fail_on_unmatched_files: true

@@ -1,0 +1,125 @@
+From 4d097f559e0e608cad64888b18d84b5f90ad1bbe Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 9 Nov 2026 13:00:34 +0100
+Subject: [PATCH] spiFlash: Wake up and reset the Flash before identifying it
+
+bmpflash talked to the Flash in whatever state it was left in. A Flash
+in power-down ignores every command but Release Power-down (0xAB), and
+one left mid-command by an interrupted run may not respond as expected.
+
+Before reading the JEDEC ID: send Release Power-down, wait for any
+operation in progress to finish, then Enable Reset (0x66) and Reset
+Device (0x99) back to back, as the W25Q128JV datasheet requires, and
+wait for the reset to complete. This follows SFUD's reset sequence as
+patched for the W25Q128JV.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/actions.cxx          |  7 +++++++
+ src/include/spiFlash.hxx |  6 ++++++
+ src/spiFlash.cxx         | 26 ++++++++++++++++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/src/actions.cxx b/src/actions.cxx
+index 53c4cc1..25bdc1b 100644
+--- a/src/actions.cxx
++++ b/src/actions.cxx
+@@ -12,6 +12,7 @@
+ #include "actions.hxx"
+ #include "flashVendors.hxx"
+ #include "sfdp.hxx"
++#include "spiFlash.hxx"
+ #include "provisionELF.hxx"
+ #include "units.hxx"
+ 
+@@ -118,6 +119,12 @@ namespace bmpflash
+ 
+ 	bool identifyFlash(const bmp_t &probe) noexcept
+ 	{
++		// Start from a known state: the Flash may have been left in power-down or mid-command
++		if (!spiFlash::spiFlash_t::wakeUpAndReset(probe))
++		{
++			console.error("Could not reset the Flash device on the requested SPI bus"sv);
++			return false;
++		}
+ 		const auto chipID{probe.identifyFlash()};
+ 		// If we got a bad all-highs read back, or the capacity is 0, then there's no device there.
+ 		if ((chipID.manufacturer == 0xffU && chipID.type == 0xffU && chipID.capacity == 0xffU) ||
+diff --git a/src/include/spiFlash.hxx b/src/include/spiFlash.hxx
+index a76dc74..dec38c2 100644
+--- a/src/include/spiFlash.hxx
++++ b/src/include/spiFlash.hxx
+@@ -37,6 +37,8 @@ namespace bmpflash::spiFlash
+ 		readSFDP = 0x5aU,
+ 		wakeUp = 0xabU,
+ 		reset = 0xffU,
++		enableReset = 0x66U,
++		resetDevice = 0x99U,
+ 	};
+ 
+ 	enum class opcodeMode_t : uint16_t
+@@ -78,6 +80,8 @@ namespace bmpflash::spiFlash
+ 		readJEDECID = command(opcodeMode_t::opcodeOnly, dataMode_t::dataIn, 0U, opcode_t::jedecID),
+ 		readSFDP = command(opcodeMode_t::with3BAddress, dataMode_t::dataIn, 1U, opcode_t::readSFDP),
+ 		wakeUp = command(opcodeMode_t::opcodeOnly, 0U, opcode_t::wakeUp),
++		enableReset = command(opcodeMode_t::opcodeOnly, 0U, opcode_t::enableReset),
++		resetDevice = command(opcodeMode_t::opcodeOnly, 0U, opcode_t::resetDevice),
+ 		pageRead = command(opcodeMode_t::with3BAddress, dataMode_t::dataIn, 0U, opcode_t::pageRead),
+ 	};
+ 
+@@ -114,6 +118,8 @@ namespace bmpflash::spiFlash
+ 		[[nodiscard]] static bool waitFlashIdle(const bmp_t &probe);
+ 		// Send Write Enable and wait until the Flash reports it set (WEL)
+ 		[[nodiscard]] static bool writeEnable(const bmp_t &probe);
++		// Release the Flash from power-down and reset it, to start from a known state
++		[[nodiscard]] static bool wakeUpAndReset(const bmp_t &probe);
+ 		[[nodiscard]] bool writeBlock(const bmp_t &probe, size_t address, const substrate::span<uint8_t> &block);
+ 		[[nodiscard]] bool readBlock(const bmp_t &probe, size_t address, substrate::span<uint8_t> block);
+ 	};
+diff --git a/src/spiFlash.cxx b/src/spiFlash.cxx
+index 74b0a47..b82bdb1 100644
+--- a/src/spiFlash.cxx
++++ b/src/spiFlash.cxx
+@@ -4,6 +4,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <string_view>
++#include <thread>
+ #include <substrate/console>
+ #include <substrate/index_sequence>
+ #include "bmp.hxx"
+@@ -66,6 +67,31 @@ namespace bmpflash::spiFlash
+ 		}
+ 	}
+ 
++	bool spiFlash_t::wakeUpAndReset(const bmp_t &probe)
++	{
++		// In power-down the Flash ignores every command but Release Power-down; tRES1 is 3us
++		if (!probe.runCommand(spiFlashCommand_t::wakeUp, 0U))
++			return false;
++		std::this_thread::sleep_for(std::chrono::milliseconds{1});
++		// No Flash on the bus reads as all highs: leave reporting that to the JEDEC ID check, without waiting
++		uint8_t status{};
++		if (!probe.read(spiFlashCommand_t::readStatus, 0U, &status, sizeof(status)))
++			return false;
++		if (status == 0xffU)
++			return true;
++		// A reset during an erase or program can corrupt data, so let any operation in progress finish first
++		if (!waitFlashIdle(probe))
++			return false;
++		// Enable Reset and Reset Device must follow each other directly: any other command in between,
++		// even a status read, cancels the Reset Enable (W25Q128JV datasheet, 8.2.37)
++		if (!probe.runCommand(spiFlashCommand_t::enableReset, 0U) ||
++			!probe.runCommand(spiFlashCommand_t::resetDevice, 0U))
++			return false;
++		// tRST is 30us
++		std::this_thread::sleep_for(std::chrono::milliseconds{1});
++		return waitFlashIdle(probe);
++	}
++
+ 	bool spiFlash_t::writeBlock(const bmp_t &probe, const size_t address, const substrate::span<uint8_t> &block)
+ 	{
+ 		console.debug("Erasing sector at 0x"sv, asHex_t<6, '0'>{address});
+-- 
+2.43.0
+

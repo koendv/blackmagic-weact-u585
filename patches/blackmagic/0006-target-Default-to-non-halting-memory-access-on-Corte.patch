@@ -1,0 +1,201 @@
+From 1de6d4668506fb9c3ba610d9e5176af9e7d0dd50 Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Sun, 8 Nov 2026 22:29:49 +0100
+Subject: [PATCH] target: Default to non-halting memory access on Cortex-M
+
+Backport of the halting defaults from blackmagic-rtthread (d5454735),
+with upstream's `mon mem_nohalt` as the runtime switch.
+
+- Cortex-M: all parts access memory through an AHB-AP that allows reads
+  while the core runs, so cortexm_probe() sets TOPT_NON_HALTING_MEM_IO.
+  The TI LM/TM4C (lmi.c) clear it again, as they return garbled data on
+  non-halting reads (see upstream PR #1962).
+- RISC-V: unchanged, harts with System Bus Access are non-halting, all
+  others halt.
+- Cortex-A/R: unchanged, halting.
+- `mon mem_nohalt [enable|disable]` moves from cortexm.c to target.c as
+  target_mem_nohalt_command() and is now also registered for RISC-V
+  harts. It is built without RTT support too, as memwatch uses the same
+  flag; the RTT re-evaluation stays conditional on ENABLE_RTT.
+- The fork's `mon rtt halt [enable|disable|auto]` is not backported.
+
+This makes RTT polling and memwatch work without halting on all
+Cortex-M targets by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/target/cortexm.c         | 36 +++---------------------------------
+ src/target/lmi.c             |  2 ++
+ src/target/riscv_debug.c     |  6 ++++++
+ src/target/target.c          | 27 +++++++++++++++++++++++++++
+ src/target/target_internal.h |  1 +
+ 5 files changed, 39 insertions(+), 33 deletions(-)
+
+diff --git a/src/target/cortexm.c b/src/target/cortexm.c
+index 96040f4..4cbba2a 100644
+--- a/src/target/cortexm.c
++++ b/src/target/cortexm.c
+@@ -44,9 +44,6 @@
+ #include "semihosting.h"
+ #include "platform.h"
+ #include "maths_utils.h"
+-#ifdef ENABLE_RTT
+-#include "rtt.h" // extern bool rtt_found;
+-#endif
+ #ifdef ENABLE_MEMWATCH
+ #include "memwatch.h"
+ #endif
+@@ -59,15 +56,10 @@
+ #define CORTEXM_MAX_REG_COUNT (CORTEXM_GENERAL_REG_COUNT + CORTEX_FLOAT_REG_COUNT + CORTEXM_TRUSTZONE_REG_COUNT)
+ 
+ static bool cortexm_vector_catch(target_s *target, int argc, const char **argv);
+-#ifdef ENABLE_RTT
+-static bool cortexm_mem_nohalt(target_s *target, int argc, const char **argv);
+-#endif
+ 
+ const command_s cortexm_cmd_list[] = {
+ 	{"vector_catch", cortexm_vector_catch, "Catch exception vectors"},
+-#ifdef ENABLE_RTT
+-	{"mem_nohalt", cortexm_mem_nohalt, "Toggle halting during memory accesses"},
+-#endif
++	{"mem_nohalt", target_mem_nohalt_command, "Toggle halting during memory accesses"},
+ #ifdef ENABLE_MEMWATCH
+ 	{"memwatch", cortexm_memwatch,
+ 		"Report changes of variables while the target runs: [status] | [/t] [[NAME] [/d|/u|/f|/f[0..9]|/x] "
+@@ -315,6 +307,8 @@ bool cortexm_probe(adiv5_access_port_s *ap)
+ 	target->check_error = cortex_check_error;
+ 	target->mem_read = cortexm_mem_read;
+ 	target->mem_write = cortexm_mem_write;
++	/* All Cortex-M parts have an AHB-AP guaranteeing non-halting memory access, except where noted (lmi.c) */
++	target->target_options |= TOPT_NON_HALTING_MEM_IO;
+ 
+ 	target->driver = "ARM Cortex-M";
+ 
+@@ -1355,30 +1349,6 @@ static bool cortexm_vector_catch(target_s *target, int argc, const char **argv)
+ 	return true;
+ }
+ 
+-#ifdef ENABLE_RTT
+-static bool cortexm_mem_nohalt(target_s *target, int argc, const char **argv)
+-{
+-	bool enable = false;
+-	if (argc > 2) {
+-		tc_printf(target, "Usage: monitor mem_nohalt <enable|disable>");
+-		return false;
+-	}
+-	if (argc == 2 && parse_enable_or_disable(argv[1], &enable)) {
+-		if (enable)
+-			target->target_options |= TOPT_NON_HALTING_MEM_IO;
+-		else
+-			target->target_options &= ~TOPT_NON_HALTING_MEM_IO;
+-		/* Force reapplying halt settings in rtt.c */
+-		rtt_found = false;
+-
+-		return true;
+-	}
+-	tc_printf(target, "Target allows non-halting memory IO: %s\n",
+-		target->target_options & TOPT_NON_HALTING_MEM_IO ? "yes" : "no");
+-	return true;
+-}
+-#endif
+-
+ static bool cortexm_hostio_request(target_s *const target)
+ {
+ 	/* Read out the information from the target needed to complete the request */
+diff --git a/src/target/lmi.c b/src/target/lmi.c
+index a4abe4f..f4c5e0b 100644
+--- a/src/target/lmi.c
++++ b/src/target/lmi.c
+@@ -186,6 +186,8 @@ bool lmi_probe(target_s *const target)
+ 		lmi_add_flash(target, dev->flash_size_k << 10, dev->block_size_k << 10);
+ 		target->driver = dev->driver;
+ 		target->target_options |= dev->target_options;
++		/* These parts return garbled data when memory is read without halting the core */
++		target->target_options &= ~TOPT_NON_HALTING_MEM_IO;
+ 		if (dev->dp_quirks)
+ 			cortex_ap(target)->dp->quirks |= dev->dp_quirks;
+ 		return true;
+diff --git a/src/target/riscv_debug.c b/src/target/riscv_debug.c
+index 0047b91..91665b4 100644
+--- a/src/target/riscv_debug.c
++++ b/src/target/riscv_debug.c
+@@ -489,6 +489,11 @@ static size_t riscv_snprint_isa_subset(
+ 	return offset;
+ }
+ 
++static const command_s riscv_cmd_list[] = {
++	{"mem_nohalt", target_mem_nohalt_command, "Toggle halting during memory accesses"},
++	{NULL, NULL, NULL},
++};
++
+ static bool riscv_hart_init(riscv_hart_s *const hart)
+ {
+ 	/* Allocate a new target */
+@@ -501,6 +506,7 @@ static bool riscv_hart_init(riscv_hart_s *const hart)
+ 	target->driver = "RISC-V";
+ 	target->priv = hart;
+ 	target->priv_free = riscv_hart_free;
++	target_add_commands(target, riscv_cmd_list, "RISC-V");
+ 
+ 	/* Request halt and read certain key registers */
+ 	riscv_halt_request(target);
+diff --git a/src/target/target.c b/src/target/target.c
+index f722ae7..e9da713 100644
+--- a/src/target/target.c
++++ b/src/target/target.c
+@@ -33,6 +33,9 @@
+ #if CONFIG_BMDA == 1
+ #include "platform.h"
+ #endif
++#ifdef ENABLE_RTT
++#include "rtt.h" // extern bool rtt_found;
++#endif
+ 
+ /* Fixup for when _FILE_OFFSET_BITS == 64 as unistd.h screws this up for us */
+ #if defined(lseek)
+@@ -440,6 +443,30 @@ bool target_mem_access_needs_halt(target_s *target)
+ 	return !(target->target_options & TOPT_NON_HALTING_MEM_IO);
+ }
+ 
++/* `mon mem_nohalt [enable|disable]`: override whether memory is accessed without halting (RTT, memwatch) */
++bool target_mem_nohalt_command(target_s *const target, const int argc, const char **const argv)
++{
++	bool enable = false;
++	if (argc > 2) {
++		tc_printf(target, "Usage: monitor mem_nohalt <enable|disable>\n");
++		return false;
++	}
++	if (argc == 2 && parse_enable_or_disable(argv[1], &enable)) {
++		if (enable)
++			target->target_options |= TOPT_NON_HALTING_MEM_IO;
++		else
++			target->target_options &= ~TOPT_NON_HALTING_MEM_IO;
++#ifdef ENABLE_RTT
++		/* Force reapplying halt settings in rtt.c */
++		rtt_found = false;
++#endif
++		return true;
++	}
++	tc_printf(target, "Target allows non-halting memory IO: %s\n",
++		target->target_options & TOPT_NON_HALTING_MEM_IO ? "yes" : "no");
++	return true;
++}
++
+ /* Register access functions */
+ size_t target_reg_read(target_s *target, uint32_t reg, void *data, size_t max)
+ {
+diff --git a/src/target/target_internal.h b/src/target/target_internal.h
+index 99793b9..9329178 100644
+--- a/src/target/target_internal.h
++++ b/src/target/target_internal.h
+@@ -222,6 +222,7 @@ void target_ram_map_free(target_s *target);
+ void target_flash_map_free(target_s *target);
+ void target_mem_map_free(target_s *target);
+ void target_add_commands(target_s *target, const command_s *cmds, const char *name);
++bool target_mem_nohalt_command(target_s *target, int argc, const char **argv);
+ void target_add_ram32(target_s *target, target_addr32_t start, uint32_t len);
+ void target_add_ram64(target_s *target, target_addr64_t start, uint64_t len);
+ void target_add_rom32(target_s *target, target_addr32_t start, uint32_t len);
+-- 
+2.43.0
+

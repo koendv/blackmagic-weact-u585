@@ -1,0 +1,4 @@
+# Keep the STM32CubeMX files exactly as CubeMX writes them (the report mixes CRLF and LF)
+cubemx/*.ioc -text
+cubemx/*.txt -text
+cubemx/*.pdf binary

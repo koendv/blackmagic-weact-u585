@@ -1,0 +1,126 @@
+From edbbd4c8909443eb160063304e36b668e85f45b9 Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Sun, 8 Nov 2026 23:12:25 +0100
+Subject: [PATCH] weact-u585: Add the mon clocks command
+
+A crystal that fails to start is signalled by LED blinks at boot, but
+when both start there is nothing to see. `monitor clocks` reports:
+
+- whether the 25MHz HSE and 32.768kHz LSE crystals run (RCC_CR.HSERDY,
+  RCC_BDCR.LSERDY)
+- the SYSCLK frequency and source, and the PLL1 input
+- the USB clock source, and for HSI48 whether the CRS is trimming it
+  against USB SOF, with the current trim value
+
+The CRS trim field is 7 bits wide on the U5; libopencm3's CRS_CR_TRIM
+only covers 6, so a local mask is used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/platforms/weact-u585/README.md  |  3 ++-
+ src/platforms/weact-u585/platform.c | 41 +++++++++++++++++++++++++++++
+ src/platforms/weact-u585/platform.h |  1 +
+ 3 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/src/platforms/weact-u585/README.md b/src/platforms/weact-u585/README.md
+index 34281e7..8e5732d 100644
+--- a/src/platforms/weact-u585/README.md
++++ b/src/platforms/weact-u585/README.md
+@@ -35,7 +35,8 @@ firmware carries on normally:
+ | 2      | LSE (32.768kHz) did not start |
+ 
+ With both failed, the HSE blinks come first, then the LSE blinks. Debug builds (`-Ddebug_output=true`)
+-also log a warning.
++also log a warning. `monitor clocks` shows whether the crystals run, and where SYSCLK and the USB clock
++come from.
+ 
+ ## Pinout
+ 
+diff --git a/src/platforms/weact-u585/platform.c b/src/platforms/weact-u585/platform.c
+index 5875a18..294f947 100644
+--- a/src/platforms/weact-u585/platform.c
++++ b/src/platforms/weact-u585/platform.c
+@@ -35,6 +35,9 @@
+ #include "usb.h"
+ #include "rcc_clocking.h"
+ #include "aux_serial.h"
++#include "command.h"
++#include "gdb_packet.h"
++#include "target_internal.h"
+ 
+ #include <libopencm3/cm3/vector.h>
+ #include <libopencm3/cm3/scb.h>
+@@ -67,6 +70,9 @@
+ #define RCC_BDCR_LSEDRV_MEDIUM_HIGH (2U << RCC_BDCR_LSEDRV_SHIFT)
+ #endif
+ 
++/* RM0456: on the U5 CRS_CR.TRIM is 7 bits wide (14:8), libopencm3's CRS_CR_TRIM covers only 6 */
++#define CRS_CR_TRIM_U5_MASK 0x7fU
++
+ /* Crystal start-up timeouts in milliseconds, the same as ST's HAL defaults (HSE_STARTUP_TIMEOUT, LSE_STARTUP_TIMEOUT) */
+ #define HSE_STARTUP_TIMEOUT_MS 100U
+ #define LSE_STARTUP_TIMEOUT_MS 5000U
+@@ -82,6 +88,13 @@
+ /* Lives in SRAM3 (see the linker script), which keeps its contents across the reset in platform_request_boot() */
+ static volatile uint32_t magic[2] __attribute__((section(".noinit")));
+ 
++static bool cmd_clocks(target_s *target, int argc, const char **argv);
++
++const command_s platform_cmd_list[] = {
++	{"clocks", cmd_clocks, "Show the clock configuration and whether the HSE and LSE crystals run"},
++	{NULL, NULL, NULL},
++};
++
+ static void platform_check_rom_bootloader_request(void);
+ static void crystals_start(void);
+ static void crystals_check(void);
+@@ -284,6 +297,34 @@ static void gpio_init(void)
+ 	gpio_mode_setup(INT_SPI_CS_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, INT_SPI_CS_PIN);
+ }
+ 
++/* `mon clocks`: report the clock tree, and whether the crystals started (see crystals_check()) */
++static bool cmd_clocks(target_s *const target, const int argc, const char **const argv)
++{
++	(void)target;
++	(void)argc;
++	(void)argv;
++	static const char *const sysclk_sources[] = {"MSIS", "HSI16", "HSE", "PLL1"};
++	static const char *const pll_sources[] = {"none", "MSIS", "HSI16", "HSE"};
++	static const char *const usb_sources[] = {"HSI48", "PLL2Q", "PLL1Q", "MSIK"};
++
++	gdb_outf("HSE 25MHz crystal:     %s\n", (RCC_CR & RCC_CR_HSERDY) ? "running" : "not running");
++	gdb_outf("LSE 32.768kHz crystal: %s\n", (RCC_BDCR & RCC_BDCR_LSERDY) ? "running" : "not running");
++
++	const uint32_t sysclk_source = (RCC_CFGR >> RCC_CFGR_SWS_SHIFT) & RCC_CFGR_SWS_MASK;
++	gdb_outf("SYSCLK %" PRIu32 "Hz from %s", rcc_get_bus_clk_freq(RCC_SYSCLK), sysclk_sources[sysclk_source]);
++	if (sysclk_source == RCC_CFGR_SWS_PLL)
++		gdb_outf(" (input %s)", pll_sources[(RCC_PLL1CFGR >> RCC_PLLCFGR_PLLSRC_SHIFT) & RCC_PLLCFGR_PLLSRC_MASK]);
++	gdb_out("\n");
++
++	const uint32_t usb_source = (RCC_CCIPR1 >> RCC_CCIPR1_ICLKSEL_SHIFT) & RCC_CCIPR1_ICLKSEL_MASK;
++	gdb_outf("USB clock from %s", usb_sources[usb_source]);
++	if (usb_source == RCC_CCIPR1_ICLKSEL_HSI48)
++		gdb_outf(", CRS %s, trim %" PRIu32, (CRS_CR & CRS_CR_AUTOTRIMEN) ? "trimming against USB SOF" : "off",
++			(uint32_t)((CRS_CR >> CRS_CR_TRIM_SHIFT) & CRS_CR_TRIM_U5_MASK));
++	gdb_out("\n");
++	return true;
++}
++
+ int platform_hwversion(void)
+ {
+ 	return 0;
+diff --git a/src/platforms/weact-u585/platform.h b/src/platforms/weact-u585/platform.h
+index eed5d23..40b5453 100644
+--- a/src/platforms/weact-u585/platform.h
++++ b/src/platforms/weact-u585/platform.h
+@@ -41,6 +41,7 @@
+ 
+ #define PLATFORM_HAS_SWO
+ #define PLATFORM_MULTI_UART
++#define PLATFORM_HAS_CUSTOM_COMMANDS
+ 
+ #if ENABLE_DEBUG == 1
+ #define PLATFORM_HAS_DEBUG
+-- 
+2.43.0
+

@@ -1,0 +1,1078 @@
+From f5301dba45c7f13eb36f62e567b48528bc5b585e Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Sun, 8 Nov 2026 20:16:50 +0100
+Subject: [PATCH] weact-u585: Add the WeAct Black Pill STM32U585 platform
+
+A BMPv3-derived platform for the WeAct Black Pill STM32U585 core board
+(STM32U585CIU6, UFQFPN48), with the pinout following the board's CubeMX
+project: JTAG/SWD and the external SPI bus on PB12-PB15, open drain nRST
+on PA15, SWO on PA1, AUX UARTs on PA2/PA3 and PA9/PA10, the internal SPI
+bus on SPI1 (PA4-PA7, U3 Flash footprint) and the user LED on PC13.
+
+Clocks are as on BMPv3. The 25MHz HSE and 32.768kHz LSE crystals are
+started at boot; a crystal that does not start is signalled by blinking
+the LED (3 times for the HSE, 2 times for the LSE) before carrying on.
+
+There is no BMD bootloader: the firmware runs from 0x08000000 and
+BOOT0 + NRST or a DFU detach enters the ST ROM DFU bootloader.
+
+The debug pins use low GPIO speed: unlike BMPv3 they drive the target
+wiring directly, and faster edges ring on jumper wires.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cross-file/weact-u585.ini               |  25 ++
+ meson_options.txt                       |   3 +-
+ src/platforms/weact-u585/README.md      |  83 +++++
+ src/platforms/weact-u585/meson.build    |  68 ++++
+ src/platforms/weact-u585/platform.c     | 427 ++++++++++++++++++++++++
+ src/platforms/weact-u585/platform.h     | 242 ++++++++++++++
+ src/platforms/weact-u585/rcc_clocking.h |  89 +++++
+ src/platforms/weact-u585/weact-u585.ld  |  45 +++
+ 8 files changed, 981 insertions(+), 1 deletion(-)
+ create mode 100644 cross-file/weact-u585.ini
+ create mode 100644 src/platforms/weact-u585/README.md
+ create mode 100644 src/platforms/weact-u585/meson.build
+ create mode 100644 src/platforms/weact-u585/platform.c
+ create mode 100644 src/platforms/weact-u585/platform.h
+ create mode 100644 src/platforms/weact-u585/rcc_clocking.h
+ create mode 100644 src/platforms/weact-u585/weact-u585.ld
+
+diff --git a/cross-file/weact-u585.ini b/cross-file/weact-u585.ini
+new file mode 100644
+index 0000000..e9a1b38
+--- /dev/null
++++ b/cross-file/weact-u585.ini
+@@ -0,0 +1,25 @@
++# This a cross-file for the WeAct Black Pill STM32U585, providing sane default options for it.
++
++[binaries]
++c = 'arm-none-eabi-gcc'
++cpp = 'arm-none-eabi-g++'
++ld = 'arm-none-eabi-gcc'
++ar = 'arm-none-eabi-ar'
++nm = 'arm-none-eabi-nm'
++strip = 'arm-none-eabi-strip'
++objcopy = 'arm-none-eabi-objcopy'
++objdump = 'arm-none-eabi-objdump'
++size = 'arm-none-eabi-size'
++
++[host_machine]
++system = 'bare-metal'
++cpu_family = 'arm'
++cpu = 'arm'
++endian = 'little'
++
++[project options]
++probe = 'weact-u585'
++targets = 'cortexar,cortexm,riscv32,riscv64,apollo3,at32f4,ch32,ch32v,ch579,efm,gd32,hc32,lattice,lpc,mm32,nrf,nxp,puya,renesas,rp,sam,stm,ti,xilinx'
++rtt_support = true
++bmd_bootloader = false
++enable_riscv_accel = true
+diff --git a/meson_options.txt b/meson_options.txt
+index cdedbe7..dffe126 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -21,7 +21,8 @@ option(
+ 		'bmp-v1-v2',
+ 		'stlink',
+ 		'stlinkv3',
+-		'swlink'
++		'swlink',
++		'weact-u585'
+ 	],
+ 	value: '',
+ 	description: 'Hardware platform where the BMD firmware will run'
+diff --git a/src/platforms/weact-u585/README.md b/src/platforms/weact-u585/README.md
+new file mode 100644
+index 0000000..34281e7
+--- /dev/null
++++ b/src/platforms/weact-u585/README.md
+@@ -0,0 +1,83 @@
++# Black Magic Debug firmware for the WeAct Black Pill STM32U585
++
++*Written by Claude (Anthropic's AI model) during development with Koen De Vleeschauwer. Not reviewed line by
++line.*
++
++This platform runs Black Magic Debug on a
++[WeAct Black Pill STM32U585 core board](https://github.com/WeActStudio/WeActStudio.STM32U585Cx_CoreBoard)
++(STM32U585CIU6, UFQFPN48). It is derived from the BMPv3 platform, with the pinout following the board's
++CubeMX project.
++
++This is not an official Black Magic Debug platform.
++
++## Features and limitations
++
++- JTAG and SWD on the board headers, as direct GPIO with no level translators: 3.3V targets only
++- SWO capture on PA1, Manchester and UART/NRZ encodings
++- Two AUX UARTs on one USB serial port; the port follows whichever UART sees activity
++- Internal SPI bus to the U3 Flash footprint, for `bmpflash`. U3 is not fitted on stock boards;
++  a W25Q128JV has been tested
++- External SPI bus on the JTAG pins, for programming a target's SPI Flash with `bmpflash`
++- No target power switch and no target voltage sense (`Target voltage: Unknown`)
++- No BMD bootloader: the firmware sits at `0x08000000` and the ST ROM DFU bootloader is used for updates
++- Single user LED (PC13) for the idle/run, error and UART activity indications
++
++## Clocks
++
++SYSCLK is 160MHz from PLL1 fed by MSIS and USB runs from HSI48 trimmed against USB SOF by the CRS,
++exactly as on BMPv3. The board's 25MHz HSE and 32.768kHz LSE crystals are started at boot but nothing
++is clocked from them yet. If a crystal does not start, the LED blinks before USB comes up, then the
++firmware carries on normally:
++
++| Blinks | Meaning                     |
++| ------ | --------------------------- |
++| 3      | HSE (25MHz) did not start   |
++| 2      | LSE (32.768kHz) did not start |
++
++With both failed, the HSE blinks come first, then the LSE blinks. Debug builds (`-Ddebug_output=true`)
++also log a warning.
++
++## Pinout
++
++| Function    | Pin  | Notes                                  |
++| ----------- | ---- | -------------------------------------- |
++| TCK/SWCLK   | PB13 | also external SPI SCLK                 |
++| TMS/SWDIO   | PB12 | also external SPI nCS                  |
++| TDI         | PB15 | also external SPI PICO                 |
++| TDO         | PB14 | also external SPI POCI                 |
++| nRST        | PA15 | open drain, internal pull-up           |
++| SWO         | PA1  | TIM5_CH2 / UART4_RX                    |
++| UART1 TX/RX | PA2/PA3   | USART2                            |
++| UART2 TX/RX | PA9/PA10  | USART1                            |
++| USB D-/D+   | PA11/PA12 | no VBUS sense                     |
++| LED         | PC13 | active low                             |
++| Flash nCS/CLK/DO/DI | PA4/PA5/PA6/PA7 | SPI1, U3 footprint |
++| HSE         | PH0/PH1   | 25MHz crystal                     |
++| LSE         | PC14/PC15 | 32.768kHz crystal                 |
++
++PA13/PA14 (SWDIO/SWCLK) on the 4-pin header debug the probe itself.
++
++## Building
++
++```sh
++meson setup build --cross-file=cross-file/weact-u585.ini
++meson compile -C build
++```
++
++This produces `build/blackmagic_weact_u585_firmware.{elf,bin}`.
++
++## Flashing
++
++Enter the ST ROM DFU bootloader (USB ID 0483:df11) by one of:
++
++- holding BOOT0 while pressing and releasing NRST
++- a DFU detach request to the running probe: `dfu-util -d 1d50:6018 -e`
++
++then:
++
++```sh
++dfu-util -a 0 -s 0x08000000:leave -D build/blackmagic_weact_u585_firmware.bin
++```
++
++On Windows, STM32CubeProgrammer installs the WinUSB driver the ROM bootloader needs and can also
++be used to flash the `.bin`.
+diff --git a/src/platforms/weact-u585/meson.build b/src/platforms/weact-u585/meson.build
+new file mode 100644
+index 0000000..ae76072
+--- /dev/null
++++ b/src/platforms/weact-u585/meson.build
+@@ -0,0 +1,68 @@
++# This file is part of the Black Magic Debug project.
++#
++# Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are met:
++#
++# 1. Redistributions of source code must retain the above copyright notice, this
++#    list of conditions and the following disclaimer.
++#
++# 2. Redistributions in binary form must reproduce the above copyright notice,
++#    this list of conditions and the following disclaimer in the documentation
++#    and/or other materials provided with the distribution.
++#
++# 3. Neither the name of the copyright holder nor the names of its
++#    contributors may be used to endorse or promote products derived from
++#    this software without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS "AS IS"
++# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++
++probe_weact_u585_includes = include_directories('.')
++
++probe_weact_u585_sources = files('platform.c')
++
++trace_protocol = get_option('trace_protocol')
++probe_weact_u585_args = [
++	'-DDFU_SERIAL_LENGTH=9',
++	f'-DSWO_ENCODING=@trace_protocol@',
++]
++probe_weact_u585_dependencies = [platform_stm32_swo]
++if trace_protocol in ['1', '3']
++	probe_weact_u585_dependencies += platform_stm32_swo_manchester
++endif
++if trace_protocol in ['2', '3']
++	probe_weact_u585_dependencies += platform_stm32_swo_uart
++endif
++
++probe_weact_u585_link_args = [
++	'-L@0@'.format(meson.current_source_dir()),
++	'-T@0@'.format('weact-u585.ld'),
++]
++
++probe_host = declare_dependency(
++	include_directories: probe_weact_u585_includes,
++	sources: probe_weact_u585_sources,
++	compile_args: probe_weact_u585_args,
++	link_args: probe_weact_u585_link_args,
++	dependencies: [platform_common, platform_stm32u5, probe_weact_u585_dependencies],
++)
++
++summary(
++	{
++		'Name': 'WeAct Black Pill STM32U585',
++		'Platform': 'STM32U5',
++		'Bootloader': 'OEM ST ROM Bootloader',
++		'Load Address': '0x8000000',
++	},
++	section: 'Probe',
++)
+diff --git a/src/platforms/weact-u585/platform.c b/src/platforms/weact-u585/platform.c
+new file mode 100644
+index 0000000..e0da0b3
+--- /dev/null
++++ b/src/platforms/weact-u585/platform.c
+@@ -0,0 +1,427 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ * Based on the BMPv3 platform by 1BitSquared
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ *    list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "general.h"
++#include "platform.h"
++#include "usb.h"
++#include "rcc_clocking.h"
++#include "aux_serial.h"
++
++#include <libopencm3/cm3/vector.h>
++#include <libopencm3/cm3/scb.h>
++#include <libopencm3/cm3/scs.h>
++#include <libopencm3/usb/dwc/otg_fs.h>
++#include <libopencm3/usb/dwc/otg_common.h>
++#include <libopencm3/stm32/rcc.h>
++#include <libopencm3/stm32/crs.h>
++#include <libopencm3/stm32/pwr.h>
++#include <libopencm3/stm32/gpio.h>
++#include <libopencm3/stm32/spi.h>
++
++/* RM0456: OTG_GOTGCTL B-peripheral session valid override enable/value */
++#ifndef OTG_GOTGCTL_BVALOEN
++#define OTG_GOTGCTL_BVALOEN (1U << 6U)
++#endif
++#ifndef OTG_GOTGCTL_BVALOVAL
++#define OTG_GOTGCTL_BVALOVAL (1U << 7U)
++#endif
++
++/* RM0456: PWR_DBPR disable backup domain write protection */
++#ifndef PWR_DBPR_DBP
++#define PWR_DBPR_DBP (1U << 0U)
++#endif
++
++/* RM0456: RCC_BDCR LSE oscillator drive capability */
++#ifndef RCC_BDCR_LSEDRV_SHIFT
++#define RCC_BDCR_LSEDRV_SHIFT       3U
++#define RCC_BDCR_LSEDRV_MASK        (3U << RCC_BDCR_LSEDRV_SHIFT)
++#define RCC_BDCR_LSEDRV_MEDIUM_HIGH (2U << RCC_BDCR_LSEDRV_SHIFT)
++#endif
++
++/* Crystal start-up timeouts in milliseconds, the same as ST's HAL defaults (HSE_STARTUP_TIMEOUT, LSE_STARTUP_TIMEOUT) */
++#define HSE_STARTUP_TIMEOUT_MS 100U
++#define LSE_STARTUP_TIMEOUT_MS 5000U
++
++/* Number of LED blinks signalling a crystal that did not start */
++#define HSE_FAIL_BLINKS 3U
++#define LSE_FAIL_BLINKS 2U
++
++/* Magic values stored across a system reset to request entry into the ROM bootloader */
++#define BOOTMAGIC0 UINT32_C(0xb007da7a)
++#define BOOTMAGIC1 UINT32_C(0xbaadfeed)
++
++/* Lives in SRAM3 (see the linker script), which keeps its contents across the reset in platform_request_boot() */
++static volatile uint32_t magic[2] __attribute__((section(".noinit")));
++
++static void platform_check_rom_bootloader_request(void);
++static void crystals_start(void);
++static void crystals_check(void);
++static void gpio_init(void);
++
++void platform_init(void)
++{
++	/* Must run first, while the chip is still in its post-reset state */
++	platform_check_rom_bootloader_request();
++
++	SCS_DEMCR |= SCS_DEMCR_VC_MON_EN;
++
++	/* Enable the FPU as we're in hard float mode and defined it to the compiler */
++	SCB_CPACR |= SCB_CPACR_CP10_FULL | SCB_CPACR_CP11_FULL;
++
++	/* Set up the NVIC vector table for the firmware */
++	SCB_VTOR = (uintptr_t)&vector_table; // NOLINT(clang-diagnostic-pointer-to-int-cast, performance-no-int-to-ptr)
++
++	/* Bring up the PLLs, set up HSI48 for USB, and set up the clock recovery system for that */
++	rcc_clock_setup_pll(&rcc_hsi_config);
++	rcc_clock_setup_hsi48();
++	crs_autotrim_usb_enable();
++	/* Power up USB controller */
++	pwr_enable_vddusb();
++	/* Power up the analog domain */
++	pwr_enable_vdda();
++	/* Route HSI48 to the USB controller */
++	rcc_set_iclk_clksel(RCC_CCIPR1_ICLKSEL_HSI48);
++
++	/* Start the crystal oscillators, they get checked once the timing subsystem is up */
++	crystals_start();
++
++	/* Enable peripherals */
++	rcc_periph_clock_enable(RCC_OTGFS);
++	rcc_periph_clock_enable(RCC_CRS);
++	rcc_periph_clock_enable(RCC_GPIOA);
++	rcc_periph_clock_enable(RCC_GPIOB);
++	rcc_periph_clock_enable(RCC_GPIOC);
++	/* Make sure to power up the timer used for trace */
++	rcc_periph_clock_enable(RCC_TIM5);
++	rcc_periph_clock_enable(RCC_CRC);
++
++	/* Setup GPIO ports */
++	gpio_init();
++
++	/* Bring up timing, check the crystals came up, then bring up USB */
++	platform_timing_init();
++	crystals_check();
++	blackmagic_usb_init();
++
++	/*
++	 * This board has no VBUS sense connection to the MCU, so disable VBUS detection and
++	 * override the B-session valid signal so the core will connect (RM0456: OTG_GCCFG.VBDEN,
++	 * OTG_GOTGCTL.BVALOEN and OTG_GOTGCTL.BVALOVAL)
++	 */
++	OTG_FS_GCCFG &= ~OTG_GCCFG_VBDEN;
++	OTG_FS_GOTGCTL |= OTG_GOTGCTL_BVALOEN | OTG_GOTGCTL_BVALOVAL;
++
++	/* Bring up the aux serial interface */
++	aux_serial_init();
++}
++
++/*
++ * Enter the STM32 ROM (system memory) bootloader, which provides USB DFU, if platform_request_boot()
++ * asked for it (a DFU detach request). The U5 has no SYSCFG memory remap, so jump to the ROM directly.
++ * Without a running firmware, BOOT0 + NRST enters the ROM bootloader too.
++ */
++static void platform_check_rom_bootloader_request(void)
++{
++	const bool boot_requested = magic[0] == BOOTMAGIC0 && magic[1] == BOOTMAGIC1;
++	magic[0] = 0U;
++	magic[1] = 0U;
++	if (!boot_requested)
++		return;
++
++	/* Load the ROM bootloader's stack pointer and reset vector, and jump to it */
++	SCB_VTOR = SYSTEM_MEM_BASE;
++	const uint32_t stack_pointer = *((const volatile uint32_t *)SYSTEM_MEM_BASE);
++	/* clang-format off */
++	__asm__ volatile(
++		"msr msp, %1\n"     /* Load the system stack register with the ROM's stack pointer */
++		"ldr pc, [%0, 4]\n" /* Jump to the ROM bootloader's reset vector */
++		: : "l"(SYSTEM_MEM_BASE), "l"(stack_pointer) : "memory");
++	/* clang-format on */
++	__builtin_unreachable();
++}
++
++/*
++ * Start the 25MHz HSE and 32.768kHz LSE crystal oscillators. Nothing is clocked from them yet,
++ * they are started so a missing or broken crystal gets noticed.
++ */
++static void crystals_start(void)
++{
++	rcc_osc_on(RCC_HSE);
++
++	/* The LSE lives in the backup domain, which is write protected after reset */
++	rcc_periph_clock_enable(RCC_PWR);
++	PWR_DBPR |= PWR_DBPR_DBP;
++	/* The backup domain survives a system reset, so the LSE may already be running */
++	if (!(RCC_BDCR & RCC_BDCR_LSEON)) {
++		/* The drive level may only be changed while the LSE is off */
++		RCC_BDCR = (RCC_BDCR & ~(RCC_BDCR_LSEDRV_MASK | RCC_BDCR_LSEBYP)) | RCC_BDCR_LSEDRV_MEDIUM_HIGH;
++		RCC_BDCR |= RCC_BDCR_LSEON;
++	}
++}
++
++static bool crystal_wait_ready(const enum rcc_osc osc, const uint32_t timeout_ms)
++{
++	platform_timeout_s timeout;
++	platform_timeout_set(&timeout, timeout_ms);
++	while (!rcc_is_osc_ready(osc)) {
++		if (platform_timeout_is_expired(&timeout))
++			return rcc_is_osc_ready(osc);
++	}
++	return true;
++}
++
++static bool lse_wait_ready(const uint32_t timeout_ms)
++{
++	platform_timeout_s timeout;
++	platform_timeout_set(&timeout, timeout_ms);
++	while (!(RCC_BDCR & RCC_BDCR_LSERDY)) {
++		if (platform_timeout_is_expired(&timeout))
++			return RCC_BDCR & RCC_BDCR_LSERDY;
++	}
++	return true;
++}
++
++/* Blink the LED count times, then pause, to signal a fault */
++static void led_blink(const uint32_t count)
++{
++	for (uint32_t blink = 0U; blink < count; ++blink) {
++		gpio_clear(LED0_PORT, LED0_PIN); /* LED on */
++		platform_delay(200U);
++		gpio_set(LED0_PORT, LED0_PIN); /* LED off */
++		platform_delay(200U);
++	}
++	platform_delay(1000U);
++}
++
++/*
++ * Check both crystals started. A failed crystal is not fatal: the LED blinks 3 times for
++ * the HSE and 2 times for the LSE, then the firmware carries on.
++ */
++static void crystals_check(void)
++{
++	const bool hse_ok = crystal_wait_ready(RCC_HSE, HSE_STARTUP_TIMEOUT_MS);
++	const bool lse_ok = lse_wait_ready(LSE_STARTUP_TIMEOUT_MS);
++	if (!hse_ok) {
++		DEBUG_WARN("HSE crystal did not start\n");
++		led_blink(HSE_FAIL_BLINKS);
++	}
++	if (!lse_ok) {
++		DEBUG_WARN("LSE crystal did not start\n");
++		led_blink(LSE_FAIL_BLINKS);
++	}
++}
++
++static void gpio_init(void)
++{
++	/*
++	 * Configure the pins used to interface to the debug interface of a target. Unlike BMPv3 these
++	 * pins drive the target wiring directly, with no buffers, so use the slowest output speed: faster
++	 * edges ring on jumper wires and corrupt SWD. Low speed still handles the fastest bit-banged clock.
++	 */
++	gpio_set_output_options(TCK_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, TCK_PIN);
++	gpio_mode_setup(TCK_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, TCK_PIN);
++	gpio_set_output_options(TMS_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, TMS_PIN);
++	gpio_mode_setup(TMS_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, TMS_PIN);
++	gpio_set_output_options(TDI_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, TDI_PIN);
++	gpio_mode_setup(TDI_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, TDI_PIN);
++	gpio_mode_setup(TDO_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, TDO_PIN);
++
++	/*
++	 * nRST is open drain so the target can pull its own reset low and we can sense that,
++	 * with the internal pull-up keeping the line defined when no target is connected
++	 */
++	gpio_set(NRST_PORT, NRST_PIN);
++	gpio_set_output_options(NRST_PORT, GPIO_OTYPE_OD, GPIO_OSPEED_25MHZ, NRST_PIN);
++	gpio_mode_setup(NRST_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLUP, NRST_PIN);
++
++	/* Configure the pin used to drive the user LED (PC13, active low), starting off */
++	gpio_set(LED0_PORT, LED0_PIN);
++	gpio_set_output_options(LED0_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_2MHZ, LED0_PIN);
++	gpio_mode_setup(LED0_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED0_PIN);
++
++	/* Configure the first UART used for the AUX serial interface */
++	gpio_set_af(AUX_UART1_PORT, GPIO_AF7, AUX_UART1_TX_PIN | AUX_UART1_RX_PIN);
++	gpio_set_output_options(AUX_UART1_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_100MHZ, AUX_UART1_TX_PIN | AUX_UART1_RX_PIN);
++	gpio_mode_setup(AUX_UART1_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, AUX_UART1_TX_PIN | AUX_UART1_RX_PIN);
++
++	/* Configure the second UART used for the AUX serial interface */
++	gpio_set_af(AUX_UART2_PORT, GPIO_AF7, AUX_UART2_TX_PIN | AUX_UART2_RX_PIN);
++	gpio_set_output_options(AUX_UART2_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_100MHZ, AUX_UART2_TX_PIN | AUX_UART2_RX_PIN);
++	gpio_mode_setup(AUX_UART2_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, AUX_UART2_TX_PIN | AUX_UART2_RX_PIN);
++
++	/* Hold the on-board SPI Flash chip select high (deselected) */
++	gpio_set(INT_SPI_CS_PORT, INT_SPI_CS_PIN);
++	gpio_set_output_options(INT_SPI_CS_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_25MHZ, INT_SPI_CS_PIN);
++	gpio_mode_setup(INT_SPI_CS_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, INT_SPI_CS_PIN);
++}
++
++int platform_hwversion(void)
++{
++	return 0;
++}
++
++void platform_nrst_set_val(const bool assert)
++{
++	gpio_set_val(NRST_PORT, NRST_PIN, !assert);
++}
++
++bool platform_nrst_get_val(void)
++{
++	/* The pin is open drain, so this reads the actual state of the reset line (asserted = low) */
++	return gpio_get(NRST_PORT, NRST_PIN) == 0U;
++}
++
++const char *platform_target_voltage(void)
++{
++	return "Unknown";
++}
++
++/* Set the bootloader request flag and reset, platform_init() then jumps into the ST ROM bootloader */
++void platform_request_boot(void)
++{
++	magic[0] = BOOTMAGIC0;
++	magic[1] = BOOTMAGIC1;
++	scb_reset_system();
++}
++
++void platform_target_clk_output_enable(const bool enable)
++{
++	/* Convert the TCK/SWCLK pin between tristate and drive */
++	gpio_mode_setup(TCK_PORT, enable ? GPIO_MODE_OUTPUT : GPIO_MODE_INPUT, GPIO_PUPD_NONE, TCK_PIN);
++}
++
++bool platform_spi_init(const spi_bus_e bus)
++{
++	uintptr_t controller;
++	if (bus == SPI_BUS_INTERNAL) {
++		controller = INT_SPI;
++		rcc_set_peripheral_clk_sel(INT_SPI, RCC_CCIPR_SPIxSEL_PCLKx);
++		rcc_periph_clock_enable(RCC_SPI1);
++		gpio_set_af(INT_SPI_SCLK_PORT, GPIO_AF5, INT_SPI_SCLK_PIN);
++		gpio_mode_setup(INT_SPI_SCLK_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, INT_SPI_SCLK_PIN);
++		gpio_set_af(INT_SPI_POCI_PORT, GPIO_AF5, INT_SPI_POCI_PIN);
++		gpio_mode_setup(INT_SPI_POCI_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, INT_SPI_POCI_PIN);
++		gpio_set_af(INT_SPI_PICO_PORT, GPIO_AF5, INT_SPI_PICO_PIN);
++		gpio_mode_setup(INT_SPI_PICO_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, INT_SPI_PICO_PIN);
++		gpio_set(INT_SPI_CS_PORT, INT_SPI_CS_PIN);
++	} else if (bus == SPI_BUS_EXTERNAL) {
++		controller = EXT_SPI;
++		rcc_set_peripheral_clk_sel(EXT_SPI, RCC_CCIPR_SPIxSEL_PCLKx);
++		rcc_periph_clock_enable(RCC_SPI2);
++		gpio_set_af(EXT_SPI_SCLK_PORT, GPIO_AF5, EXT_SPI_SCLK_PIN);
++		gpio_mode_setup(EXT_SPI_SCLK_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, EXT_SPI_SCLK_PIN);
++		gpio_set_af(EXT_SPI_POCI_PORT, GPIO_AF5, EXT_SPI_POCI_PIN);
++		gpio_mode_setup(EXT_SPI_POCI_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, EXT_SPI_POCI_PIN);
++		gpio_set_af(EXT_SPI_PICO_PORT, GPIO_AF5, EXT_SPI_PICO_PIN);
++		gpio_mode_setup(EXT_SPI_PICO_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, EXT_SPI_PICO_PIN);
++		/* The chip select shares the TMS/SWDIO pin, which is normally an input, so make it a deselected output */
++		gpio_set(EXT_SPI_CS_PORT, EXT_SPI_CS_PIN);
++		gpio_mode_setup(EXT_SPI_CS_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, EXT_SPI_CS_PIN);
++	} else
++		return false;
++
++	/*
++	 * Run the internal bus at 20MHz (160MHz / 8), and the external bus at 10MHz (160MHz / 16)
++	 * to be kind to flying wires
++	 */
++	const uint32_t baudrate = bus == SPI_BUS_INTERNAL ? SPI_CFG1_MBR_DIV8 : SPI_CFG1_MBR_DIV16;
++	spi_init_master(controller, baudrate, SPI_CFG2_CPOL_CLK_TO_0_WHEN_IDLE, SPI_CFG2_CPHA_CLK_TRANSITION_1,
++		SPI_CFG1_DSIZE_8BIT, SPI_CFG2_MSBFIRST, SPI_CFG2_SP_MOTOROLA);
++	spi_enable(controller);
++
++	if (bus == SPI_BUS_INTERNAL) {
++		/*
++		 * Release the on-board Flash from power-down, should anything have put it there: in power-down it
++		 * ignores every command but this one. Harmless otherwise. tRES1 is 3us, so 1ms is plenty.
++		 */
++		platform_spi_chip_select(SPI_DEVICE_INT_FLASH | 0x80U);
++		platform_spi_xfer(SPI_BUS_INTERNAL, 0xabU);
++		platform_spi_chip_select(SPI_DEVICE_INT_FLASH);
++		platform_delay(1U);
++	}
++	return true;
++}
++
++bool platform_spi_deinit(const spi_bus_e bus)
++{
++	if (bus == SPI_BUS_INTERNAL) {
++		spi_disable(INT_SPI);
++		rcc_periph_clock_disable(RCC_SPI1);
++		/* Release the bus pins, keeping the Flash deselected */
++		gpio_mode_setup(INT_SPI_SCLK_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, INT_SPI_SCLK_PIN);
++		gpio_mode_setup(INT_SPI_POCI_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, INT_SPI_POCI_PIN);
++		gpio_mode_setup(INT_SPI_PICO_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, INT_SPI_PICO_PIN);
++		gpio_set(INT_SPI_CS_PORT, INT_SPI_CS_PIN);
++	} else if (bus == SPI_BUS_EXTERNAL) {
++		spi_disable(EXT_SPI);
++		rcc_periph_clock_disable(RCC_SPI2);
++		/* Return the pins to their debug interface configuration, as set up by gpio_init() */
++		gpio_mode_setup(TCK_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, TCK_PIN);
++		gpio_mode_setup(TMS_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, TMS_PIN);
++		gpio_mode_setup(TDI_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, TDI_PIN);
++		gpio_mode_setup(TDO_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, TDO_PIN);
++	} else
++		return false;
++	return true;
++}
++
++bool platform_spi_chip_select(const uint8_t device_select)
++{
++	/* Bit 7 set means select, which drives the active low chip select low */
++	const uint8_t device = device_select & 0x7fU;
++	const bool select = !(device_select & 0x80U);
++	uint32_t port;
++	uint16_t pin;
++	switch (device) {
++	case SPI_DEVICE_INT_FLASH:
++		port = INT_SPI_CS_PORT;
++		pin = INT_SPI_CS_PIN;
++		break;
++	case SPI_DEVICE_EXT_FLASH:
++		port = EXT_SPI_CS_PORT;
++		pin = EXT_SPI_CS_PIN;
++		break;
++	default:
++		return false;
++	}
++	gpio_set_val(port, pin, select);
++	return true;
++}
++
++uint8_t platform_spi_xfer(const spi_bus_e bus, const uint8_t value)
++{
++	if (bus == SPI_BUS_INTERNAL)
++		return spi_xfer8(INT_SPI, value);
++	if (bus == SPI_BUS_EXTERNAL)
++		return spi_xfer8(EXT_SPI, value);
++	return 0xffU;
++}
+diff --git a/src/platforms/weact-u585/platform.h b/src/platforms/weact-u585/platform.h
+new file mode 100644
+index 0000000..f343028
+--- /dev/null
++++ b/src/platforms/weact-u585/platform.h
+@@ -0,0 +1,242 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ * Based on the BMPv3 platform by 1BitSquared
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ *    list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/* This file provides the platform specific declarations for the WeAct Black Pill STM32U585 implementation. */
++
++#ifndef PLATFORMS_WEACT_U585_PLATFORM_H
++#define PLATFORMS_WEACT_U585_PLATFORM_H
++
++#include "gpio.h"
++#include "timing.h"
++#include "timing_stm32.h"
++
++#define PLATFORM_HAS_SWO
++#define PLATFORM_MULTI_UART
++
++#if ENABLE_DEBUG == 1
++#define PLATFORM_HAS_DEBUG
++extern bool debug_bmp;
++#endif
++
++#define PLATFORM_IDENT "WeAct U585 "
++
++/*
++ * Important pin mappings for the WeAct Black Pill STM32U585 (STM32U585CIU6, UFQFPN48):
++ *
++ * State Indication LED:
++ * LED0      = PC13 (Blue user LED, active low)
++ *
++ * Host Interface & Misc:
++ * USB_D+    = PA12
++ * USB_D-    = PA11
++ * HSE       = PH0/PH1   (25MHz crystal)
++ * LSE       = PC14/PC15 (32.768kHz crystal)
++ *
++ * Target Debug Interface (direct GPIO, 3.3V only):
++ * nRST      = PA15 (open drain)
++ * TCK       = PB13
++ * TMS       = PB12
++ * TDI       = PB15
++ * TDO       = PB14
++ * SWCLK     = PB13
++ * SWDIO     = PB12
++ * SWO       = PA1
++ *
++ * Target Comms Interface:
++ * TXD1      = PA2
++ * RXD1      = PA3
++ * TXD2      = PA9
++ * RXD2      = PA10
++ *
++ * On-Board SPI Flash (U3 footprint, e.g. W25Q128JV, usually not fitted):
++ * FLASH_nCS = PA4
++ * FLASH_CLK = PA5
++ * FLASH_DO  = PA6
++ * FLASH_DI  = PA7
++ */
++
++/* Hardware definitions... */
++#define TCK_PORT GPIOB
++#define TCK_PIN  GPIO13
++#define TMS_PORT GPIOB
++#define TMS_PIN  GPIO12
++#define TDI_PORT GPIOB
++#define TDI_PIN  GPIO15
++#define TDO_PORT GPIOB
++#define TDO_PIN  GPIO14
++
++#define SWCLK_PORT GPIOB
++#define SWDIO_PORT GPIOB
++#define SWCLK_PIN  GPIO13
++#define SWDIO_PIN  GPIO12
++
++#define EXT_SPI           SPI2
++#define EXT_SPI_SCLK_PORT GPIOB
++#define EXT_SPI_SCLK_PIN  GPIO13
++#define EXT_SPI_CS_PORT   GPIOB
++#define EXT_SPI_CS_PIN    GPIO12
++#define EXT_SPI_POCI_PORT GPIOB
++#define EXT_SPI_POCI_PIN  GPIO14
++#define EXT_SPI_PICO_PORT GPIOB
++#define EXT_SPI_PICO_PIN  GPIO15
++
++#define INT_SPI           SPI1
++#define INT_SPI_SCLK_PORT GPIOA
++#define INT_SPI_SCLK_PIN  GPIO5
++#define INT_SPI_CS_PORT   GPIOA
++#define INT_SPI_CS_PIN    GPIO4
++#define INT_SPI_POCI_PORT GPIOA
++#define INT_SPI_POCI_PIN  GPIO6
++#define INT_SPI_PICO_PORT GPIOA
++#define INT_SPI_PICO_PIN  GPIO7
++
++#define NRST_PORT GPIOA
++#define NRST_PIN  GPIO15
++
++#define SWO_PORT GPIOA
++#define SWO_PIN  GPIO1
++
++#define USB_PORT   GPIOA
++#define USB_DP_PIN GPIO12
++#define USB_DM_PIN GPIO11
++
++#define LED0_PORT         GPIOC
++#define LED0_PIN          GPIO13
++#define LED_UART_PORT     LED0_PORT
++#define LED_UART_PIN      LED0_PIN
++#define LED_IDLE_RUN_PORT LED0_PORT
++#define LED_IDLE_RUN_PIN  LED0_PIN
++#define LED_ERROR_PORT    LED0_PORT
++#define LED_ERROR_PIN     LED0_PIN
++
++#define TMS_SET_MODE() gpio_mode_setup(TMS_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, TMS_PIN)
++
++#define SWDIO_MODE_FLOAT() gpio_mode_setup(SWDIO_PORT, GPIO_MODE_INPUT, GPIO_PUPD_NONE, SWDIO_PIN)
++
++#define SWDIO_MODE_DRIVE() gpio_mode_setup(SWDIO_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, SWDIO_PIN)
++
++#define UART_PIN_SETUP()
++
++#define USB_DRIVER otgfs_usb_driver
++#define USB_IRQ    NVIC_USB_IRQ
++#define USB_ISR(x) usb_isr(x)
++/*
++ * Interrupt priorities. Low numbers are high priority.
++ * TIM5 is used for SWO capture and must be highest priority.
++ */
++#define IRQ_PRI_USB          (1U << 4U)
++#define IRQ_PRI_AUX_UART     (2U << 4U)
++#define IRQ_PRI_AUX_UART_DMA (2U << 4U)
++#define IRQ_PRI_SWO_TIM      (0U << 4U)
++#define IRQ_PRI_SWO_DMA      (0U << 4U)
++
++/* PA2/3 as USART2 TX/RX */
++#define AUX_UART1                  USART2
++#define AUX_UART1_CLK              RCC_USART2
++#define AUX_UART1_IRQ              NVIC_USART2_IRQ
++#define AUX_UART1_ISR(x)           usart2_isr(x)
++#define AUX_UART1_PORT             GPIOA
++#define AUX_UART1_TX_PIN           GPIO2
++#define AUX_UART1_RX_PIN           GPIO3
++#define AUX_UART1_RX_DETECT_EXTI   EXTI3
++#define AUX_UART1_RX_DETECT_IRQ    NVIC_EXTI3_IRQ
++#define AUX_UART1_RX_DETECT_ISR(x) exti3_isr(x)
++
++/* PA9/10 as USART1 TX/RX */
++#define AUX_UART2                   USART1
++#define AUX_UART2_CLK               RCC_USART1
++#define AUX_UART2_IRQ               NVIC_USART1_IRQ
++#define AUX_UART2_ISR(x)            usart1_isr(x)
++#define AUX_UART2_PORT              GPIOA
++#define AUX_UART2_TX_PIN            GPIO9
++#define AUX_UART2_RX_PIN            GPIO10
++#define AUX_UART2_RX_DETECT_EXTI1   EXTI10
++#define AUX_UART2_RX_DETECT_EXTI2   EXTI9
++#define AUX_UART2_RX_DETECT_EXTI    (AUX_UART2_RX_DETECT_EXTI1 | AUX_UART2_RX_DETECT_EXTI2)
++#define AUX_UART2_RX_DETECT_IRQ1    NVIC_EXTI10_IRQ
++#define AUX_UART2_RX_DETECT_IRQ2    NVIC_EXTI9_IRQ
++#define AUX_UART2_RX_DETECT_ISR1(x) exti10_isr(x)
++#define AUX_UART2_RX_DETECT_ISR2(x) exti9_isr(x)
++
++#define AUX_UART_DMA_BUS        GPDMA1
++#define AUX_UART_DMA_CLK        RCC_GPDMA1
++#define AUX_UART_DMA_TX_CHAN    DMA_CHANNEL0
++#define AUX_UART_DMA_RX_CHAN    DMA_CHANNEL1
++#define AUX_UART_DMA_TX_IRQ     NVIC_GPDMA1_CH0_IRQ
++#define AUX_UART_DMA_TX_ISR(x)  gpdma1_ch0_isr(x)
++#define AUX_UART_DMA_RX_IRQ     NVIC_GPDMA1_CH1_IRQ
++#define AUX_UART_DMA_RX_ISR(x)  gpdma1_ch1_isr(x)
++#define AUX_UART1_DMA_REQSEL_TX GPDMA1_CxTR2_REQSEL_USART2_TX
++#define AUX_UART1_DMA_REQSEL_RX GPDMA1_CxTR2_REQSEL_USART2_RX
++#define AUX_UART2_DMA_REQSEL_TX GPDMA1_CxTR2_REQSEL_USART1_TX
++#define AUX_UART2_DMA_REQSEL_RX GPDMA1_CxTR2_REQSEL_USART1_RX
++
++/* Use TIM5 Input 2 (from PA1/SWO) for Manchester data recovery */
++#define SWO_TIM TIM5
++#define SWO_TIM_CLK_EN()
++#define SWO_TIM_IRQ         NVIC_TIM5_IRQ
++#define SWO_TIM_ISR(x)      tim5_isr(x)
++#define SWO_IC_IN_CH        TIM_IC2        /* Input channel 2 */
++#define SWO_IC_IN_CH_SEL    TIM_IC_SEL_IN0 /* TIM5_CH2 from the input mux */
++#define SWO_IC_IN           TIM_IC_IN_TI2
++#define SWO_IC_RISING       TIM_IC2
++#define SWO_CC_RISING       TIM5_CCR2
++#define SWO_ITR_RISING      TIM_DIER_CC2IE
++#define SWO_STATUS_RISING   TIM_SR_CC2IF
++#define SWO_IC_FALLING      TIM_IC1
++#define SWO_CC_FALLING      TIM5_CCR1
++#define SWO_STATUS_FALLING  TIM_SR_CC1IF
++#define SWO_STATUS_OVERFLOW (TIM_SR_CC1OF | TIM_SR_CC2OF)
++#define SWO_TRIG_IN         TIM_SMCR_TS_TI2FP2
++#define SWO_TIM_PIN_AF      GPIO_AF2
++
++/* Use PA1 (UART4) for UART/NRZ/Async data recovery */
++#define SWO_UART        USART4
++#define SWO_UART_CLK    RCC_UART4
++#define SWO_UART_DR     USART4_RDR
++#define SWO_UART_PORT   SWO_PORT
++#define SWO_UART_RX_PIN SWO_PIN
++#define SWO_UART_PIN_AF GPIO_AF8
++
++#define SWO_DMA_BUS     GPDMA1
++#define SWO_DMA_CLK     RCC_GPDMA1
++#define SWO_DMA_CHAN    DMA_CHANNEL2
++#define SWO_DMA_IRQ     NVIC_GPDMA1_CH2_IRQ
++#define SWO_DMA_ISR(x)  gpdma1_ch2_isr(x)
++#define SWO_DMA_REQ_SRC GPDMA1_CxTR2_REQSEL_UART4_RX
++
++#define SET_RUN_STATE(state) running_status = (state)
++/* PC13 is active low, so invert the LED states */
++#define SET_IDLE_STATE(state)  gpio_set_val(LED_IDLE_RUN_PORT, LED_IDLE_RUN_PIN, !(state))
++#define SET_ERROR_STATE(state) gpio_set_val(LED_ERROR_PORT, LED_ERROR_PIN, !(state))
++
++#endif /* PLATFORMS_WEACT_U585_PLATFORM_H */
+diff --git a/src/platforms/weact-u585/rcc_clocking.h b/src/platforms/weact-u585/rcc_clocking.h
+new file mode 100644
+index 0000000..6ee8062
+--- /dev/null
++++ b/src/platforms/weact-u585/rcc_clocking.h
+@@ -0,0 +1,89 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ * Based on the BMPv3 platform by 1BitSquared
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ *    list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
++ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
++ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/* This file provides the RCC clocking configuration for the WeAct Black Pill STM32U585 platform. */
++
++#ifndef PLATFORMS_WEACT_U585_RCC_CLOCKING_H
++#define PLATFORMS_WEACT_U585_RCC_CLOCKING_H
++
++#include <libopencm3/stm32/rcc.h>
++#include <libopencm3/stm32/pwr.h>
++#include <libopencm3/stm32/flash.h>
++
++static struct rcc_pll_config rcc_hsi_config = {
++	/*
++	 * Use PLL1 as our clock source, fed from MSIS exactly as on BMPv3. The board's 25MHz HSE
++	 * crystal is started (see platform.c) but does not clock anything yet
++	 */
++	.sysclock_source = RCC_PLL1,
++	.hse_frequency = 0U,
++	/* Set the MSIS up to output 48MHz, which is the 3x the max in for the PLLs */
++	.msis_range = RCC_MSI_RANGE_48MHZ,
++	.pll1 =
++		{
++			/* PLL1 is then set up to consume MSIS as input */
++			.pll_source = RCC_PLLCFGR_PLLSRC_MSIS,
++			/* Divide 48MHz down to 16MHz as input to get the clock in range */
++			.divm = 3U,
++			/* Multiply up to 320 MHz */
++			.divn = 20U,
++			/* Make use of output R for the main system clock at 160MHz */
++			.divr = 2U,
++		},
++	.pll2 =
++		{
++			.pll_source = RCC_PLLCFGR_PLLSRC_NONE,
++			.divm = 0U,
++		},
++	.pll3 =
++		{
++			.pll_source = RCC_PLLCFGR_PLLSRC_NONE,
++			.divm = 0U,
++		},
++	/* SYSCLK is 160MHz, so no need to divide it down for AHB */
++	.hpre = RCC_CFGR2_HPRE_NODIV,
++	/* Or for APB1 */
++	.ppre1 = RCC_PPRE_NODIV,
++	/* Or for APB2 */
++	.ppre2 = RCC_PPRE_NODIV,
++	/* APB3 is fed by SYSCLK too and may also run at 160MHz */
++	.ppre3 = RCC_PPRE_NODIV,
++	/* We aren't using DSI, so let that be at defaults */
++	.dpre = RCC_CFGR2_DPRE_DEFAULT,
++	/* Flash requires 4 wait states to access at 160MHz per RM0456 §7.3.3 Read access latency */
++	.flash_waitstates = FLASH_ACR_LATENCY_4WS,
++	/* 1.2V -> 160MHz f(max), use the LDO to power everything as we don't have a SMPS in this package */
++	.voltage_scale = PWR_VOS_SCALE_1,
++	.power_mode = PWR_SYS_LDO,
++};
++
++#endif /* PLATFORMS_WEACT_U585_RCC_CLOCKING_H */
+diff --git a/src/platforms/weact-u585/weact-u585.ld b/src/platforms/weact-u585/weact-u585.ld
+new file mode 100644
+index 0000000..eee0ce0
+--- /dev/null
++++ b/src/platforms/weact-u585/weact-u585.ld
+@@ -0,0 +1,45 @@
++/*
++ * This file is part of the Black Magic Debug project.
++ *
++ * Copyright (C) 2026 Koen De Vleeschauwer <kdv@kdvelectronics.eu>
++ * Based on the BMPv3 linker script by 1BitSquared
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/* Define memory regions. */
++MEMORY
++{
++	/*
++	 * The full 2MiB of Flash is available as there is no bootloader for this platform,
++	 * entry to the ST ROM DFU bootloader is via BOOT0 + NRST or a DFU detach request
++	 */
++	rom (rx) : ORIGIN = 0x08000000, LENGTH = 2M
++	/*
++	 * We actually have 784KiB available, but we want to be in the main 512KiB area
++	 * that optionally runs ECC. We're not using ECC, however this is one large 8x64KiB
++	 * block that is contiguous, marked NS, and behaves the way we expect it to.
++	 *
++	 * NB: SRAM on this part is mapped as:
++	 * SRAM1: 0x20000000 - 0x20030000
++	 * SRAM2: 0x20030000 - 0x20040000
++	 * SRAM3: 0x20040000 - 0x200c0000
++	 *
++	 * SRAM2 is erased when the system is reset, all other SRAMs retain their contents.
++	 */
++	ram (rwx) : ORIGIN = 0x20040000, LENGTH = 512K
++}
++
++/* Include the platform common linker script. */
++INCLUDE ../common/blackmagic.ld
+-- 
+2.43.0
+

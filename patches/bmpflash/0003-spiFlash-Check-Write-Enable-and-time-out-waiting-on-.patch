@@ -1,0 +1,122 @@
+From d6e088cd60de35f8ec2054cda19ff86c84387eb6 Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 9 Nov 2026 12:59:55 +0100
+Subject: [PATCH] spiFlash: Check Write Enable and time out waiting on the
+ Flash
+
+waitFlashIdle() polled the status register without limit. A missing or
+unconnected Flash reads as all highs, so its busy bit looks set forever
+and bmpflash hung. Give up after 10 s, longer than any erase or program
+operation bmpflash uses.
+
+After Write Enable, poll the status register until WEL is set (100 ms
+limit), as SFUD does, instead of starting the erase or program without
+knowing whether the Flash accepted it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/include/spiFlash.hxx |  5 ++++-
+ src/spiFlash.cxx         | 41 ++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/src/include/spiFlash.hxx b/src/include/spiFlash.hxx
+index 3976e34..a76dc74 100644
+--- a/src/include/spiFlash.hxx
++++ b/src/include/spiFlash.hxx
+@@ -110,7 +110,10 @@ namespace bmpflash::spiFlash
+ 		[[nodiscard]] constexpr auto capacity() const noexcept { return capacity_; }
+ 		[[nodiscard]] constexpr auto sectorEraseOpcode() const noexcept { return sectorEraseOpcode_; }
+ 
+-		[[nodiscard]] bool waitFlashIdle(const bmp_t &probe);
++		// Wait until the Flash is no longer busy, giving up after a time-out
++		[[nodiscard]] static bool waitFlashIdle(const bmp_t &probe);
++		// Send Write Enable and wait until the Flash reports it set (WEL)
++		[[nodiscard]] static bool writeEnable(const bmp_t &probe);
+ 		[[nodiscard]] bool writeBlock(const bmp_t &probe, size_t address, const substrate::span<uint8_t> &block);
+ 		[[nodiscard]] bool readBlock(const bmp_t &probe, size_t address, substrate::span<uint8_t> block);
+ 	};
+diff --git a/src/spiFlash.cxx b/src/spiFlash.cxx
+index c579729..74b0a47 100644
+--- a/src/spiFlash.cxx
++++ b/src/spiFlash.cxx
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ // SPDX-FileCopyrightText: 2023 1BitSquared <info@1bitsquared.com>
+ // SPDX-FileContributor: Written by Rachel Mant <git@dragonmux.network>
++#include <chrono>
+ #include <cstdint>
+ #include <string_view>
+ #include <substrate/console>
+@@ -15,11 +16,24 @@ using substrate::indexSequence_t;
+ 
+ namespace bmpflash::spiFlash
+ {
++	// Longer than any erase or program operation bmpflash uses (sector erase: 400ms max on the W25Q128JV)
++	constexpr static auto flashIdleTimeout{std::chrono::seconds{10}};
++	// Write Enable takes effect at once; this only covers the round trips to the probe
++	constexpr static auto writeEnableTimeout{std::chrono::milliseconds{100}};
++
+ 	bool spiFlash_t::waitFlashIdle(const bmp_t &probe)
+ 	{
++		const auto deadline{std::chrono::steady_clock::now() + flashIdleTimeout};
+ 		uint8_t status = spiStatusBusy;
+ 		while (status & spiStatusBusy)
+ 		{
++			// A missing Flash reads as all highs, which looks busy forever, so do not wait without limit
++			if (std::chrono::steady_clock::now() > deadline)
++			{
++				console.error("Timed out waiting for the SPI Flash to finish (status 0x"sv,
++					asHex_t<2, '0'>{status}, ')');
++				return false;
++			}
+ 			if (!probe.read(spiFlashCommand_t::readStatus, 0U, &status, sizeof(status)))
+ 			{
+ 				console.error("Failed to read SPI Flash status"sv);
+@@ -29,11 +43,34 @@ namespace bmpflash::spiFlash
+ 		return true;
+ 	}
+ 
++	bool spiFlash_t::writeEnable(const bmp_t &probe)
++	{
++		if (!probe.runCommand(spiFlashCommand_t::writeEnable, 0U))
++			return false;
++		const auto deadline{std::chrono::steady_clock::now() + writeEnableTimeout};
++		uint8_t status = 0U;
++		while (true)
++		{
++			if (!probe.read(spiFlashCommand_t::readStatus, 0U, &status, sizeof(status)))
++			{
++				console.error("Failed to read SPI Flash status"sv);
++				return false;
++			}
++			if ((status & spiStatusWriteEnabled) && !(status & spiStatusBusy))
++				return true;
++			if (std::chrono::steady_clock::now() > deadline)
++			{
++				console.error("SPI Flash did not enable writing (status 0x"sv, asHex_t<2, '0'>{status}, ')');
++				return false;
++			}
++		}
++	}
++
+ 	bool spiFlash_t::writeBlock(const bmp_t &probe, const size_t address, const substrate::span<uint8_t> &block)
+ 	{
+ 		console.debug("Erasing sector at 0x"sv, asHex_t<6, '0'>{address});
+ 		// Start by erasing the block
+-		if (!probe.runCommand(spiFlashCommand_t::writeEnable, 0U) ||
++		if (!writeEnable(probe) ||
+ 			!probe.runCommand(spiFlashCommand_t::sectorErase | sectorEraseOpcode_, static_cast<uint32_t>(address)) ||
+ 			!waitFlashIdle(probe))
+ 		{
+@@ -44,7 +81,7 @@ namespace bmpflash::spiFlash
+ 		for (const auto offset : indexSequence_t{block.size()}.step(pageSize_))
+ 		{
+ 			// Try to enable write
+-			if (!probe.runCommand(spiFlashCommand_t::writeEnable, 0U))
++			if (!writeEnable(probe))
+ 			{
+ 				console.error("Failed to prepare SPI Flash block for writing"sv);
+ 				return false;
+-- 
+2.43.0
+

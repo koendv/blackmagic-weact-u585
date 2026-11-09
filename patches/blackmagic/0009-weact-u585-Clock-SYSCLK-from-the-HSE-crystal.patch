@@ -1,0 +1,265 @@
+From dda7a1936b1df80d5adb6396a1cd0653f7fe678a Mon Sep 17 00:00:00 2001
+From: Koen De Vleeschauwer <kdv@kdvelectronics.eu>
+Date: Mon, 9 Nov 2026 08:03:53 +0100
+Subject: [PATCH] weact-u585: Clock SYSCLK from the HSE crystal
+
+SYSCLK now runs at 160MHz from PLL1 fed by the board's 25MHz HSE crystal
+(25MHz / 5 * 64 / 2, VOS1, 4 wait states), the configuration WeAct uses
+in its own examples for this board. USB keeps running from HSI48 trimmed
+by the CRS against USB SOF, also as in WeAct's examples.
+
+rcc_clock_setup_pll() waits without a timeout for the HSE, so the
+firmware first starts the HSE itself and waits up to 100ms for it, timed
+with the CPU cycle counter as the clocks are not set up yet. If the
+crystal does not start, SYSCLK runs at 160MHz from PLL1 fed by MSIS as
+before (the BMPv3 configuration), and the LED blinks 3 times at boot.
+`monitor clocks` shows which input PLL1 uses.
+
+SYSCLK stays 160MHz either way, so the bit-banging calibration is
+unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/platforms/weact-u585/README.md      | 21 +++++----
+ src/platforms/weact-u585/platform.c     | 59 ++++++++++++++++---------
+ src/platforms/weact-u585/platform.h     |  2 +-
+ src/platforms/weact-u585/rcc_clocking.h | 49 ++++++++++++++++++--
+ 4 files changed, 96 insertions(+), 35 deletions(-)
+
+diff --git a/src/platforms/weact-u585/README.md b/src/platforms/weact-u585/README.md
+index 8e5732d..a45531b 100644
+--- a/src/platforms/weact-u585/README.md
++++ b/src/platforms/weact-u585/README.md
+@@ -24,15 +24,18 @@ This is not an official Black Magic Debug platform.
+ 
+ ## Clocks
+ 
+-SYSCLK is 160MHz from PLL1 fed by MSIS and USB runs from HSI48 trimmed against USB SOF by the CRS,
+-exactly as on BMPv3. The board's 25MHz HSE and 32.768kHz LSE crystals are started at boot but nothing
+-is clocked from them yet. If a crystal does not start, the LED blinks before USB comes up, then the
+-firmware carries on normally:
+-
+-| Blinks | Meaning                     |
+-| ------ | --------------------------- |
+-| 3      | HSE (25MHz) did not start   |
+-| 2      | LSE (32.768kHz) did not start |
++SYSCLK is 160MHz from PLL1 fed by the board's 25MHz HSE crystal (25MHz / 5 * 64 / 2), as in WeAct's
++examples for this board. USB runs from HSI48 trimmed against USB SOF by the CRS. The 32.768kHz LSE
++crystal is started at boot but nothing is clocked from it.
++
++If the HSE crystal does not start within 100ms, SYSCLK runs at 160MHz from PLL1 fed by MSIS instead, as
++on BMPv3, and the probe works as usual. A crystal that does not start is signalled by LED blinks before
++USB comes up, then the firmware carries on normally:
++
++| Blinks | Meaning                                         |
++| ------ | ----------------------------------------------- |
++| 3      | HSE (25MHz) did not start, running from MSIS    |
++| 2      | LSE (32.768kHz) did not start                   |
+ 
+ With both failed, the HSE blinks come first, then the LSE blinks. Debug builds (`-Ddebug_output=true`)
+ also log a warning. `monitor clocks` shows whether the crystals run, and where SYSCLK and the USB clock
+diff --git a/src/platforms/weact-u585/platform.c b/src/platforms/weact-u585/platform.c
+index 294f947..457b494 100644
+--- a/src/platforms/weact-u585/platform.c
++++ b/src/platforms/weact-u585/platform.c
+@@ -42,6 +42,7 @@
+ #include <libopencm3/cm3/vector.h>
+ #include <libopencm3/cm3/scb.h>
+ #include <libopencm3/cm3/scs.h>
++#include <libopencm3/cm3/dwt.h>
+ #include <libopencm3/usb/dwc/otg_fs.h>
+ #include <libopencm3/usb/dwc/otg_common.h>
+ #include <libopencm3/stm32/rcc.h>
+@@ -88,6 +89,12 @@
+ /* Lives in SRAM3 (see the linker script), which keeps its contents across the reset in platform_request_boot() */
+ static volatile uint32_t magic[2] __attribute__((section(".noinit")));
+ 
++/* The core runs from the 4MHz MSIS reset clock until the clocks are set up */
++#define RESET_CLOCK_KHZ 4000U
++
++/* Whether the HSE crystal started at boot, and so whether SYSCLK runs from it */
++static bool hse_ok = false;
++
+ static bool cmd_clocks(target_s *target, int argc, const char **argv);
+ 
+ const command_s platform_cmd_list[] = {
+@@ -96,6 +103,7 @@ const command_s platform_cmd_list[] = {
+ };
+ 
+ static void platform_check_rom_bootloader_request(void);
++static bool hse_start(void);
+ static void crystals_start(void);
+ static void crystals_check(void);
+ static void gpio_init(void);
+@@ -113,8 +121,13 @@ void platform_init(void)
+ 	/* Set up the NVIC vector table for the firmware */
+ 	SCB_VTOR = (uintptr_t)&vector_table; // NOLINT(clang-diagnostic-pointer-to-int-cast, performance-no-int-to-ptr)
+ 
+-	/* Bring up the PLLs, set up HSI48 for USB, and set up the clock recovery system for that */
+-	rcc_clock_setup_pll(&rcc_hsi_config);
++	/*
++	 * Run SYSCLK from the HSE crystal through PLL1, or from MSIS if the crystal does not start
++	 * (rcc_clock_setup_pll() would wait forever for a dead HSE, so check it first). Then set up
++	 * HSI48 for USB, and the clock recovery system for that.
++	 */
++	hse_ok = hse_start();
++	rcc_clock_setup_pll(hse_ok ? &rcc_hse_config : &rcc_hsi_config);
+ 	rcc_clock_setup_hsi48();
+ 	crs_autotrim_usb_enable();
+ 	/* Power up USB controller */
+@@ -124,7 +137,7 @@ void platform_init(void)
+ 	/* Route HSI48 to the USB controller */
+ 	rcc_set_iclk_clksel(RCC_CCIPR1_ICLKSEL_HSI48);
+ 
+-	/* Start the crystal oscillators, they get checked once the timing subsystem is up */
++	/* Start the LSE crystal, it gets checked once the timing subsystem is up */
+ 	crystals_start();
+ 
+ 	/* Enable peripherals */
+@@ -183,13 +196,28 @@ static void platform_check_rom_bootloader_request(void)
+ }
+ 
+ /*
+- * Start the 25MHz HSE and 32.768kHz LSE crystal oscillators. Nothing is clocked from them yet,
+- * they are started so a missing or broken crystal gets noticed.
++ * Start the 25MHz HSE crystal and wait up to HSE_STARTUP_TIMEOUT_MS for it. This runs before
++ * the clocks are set up, so time it with the CPU cycle counter at the reset clock.
+  */
+-static void crystals_start(void)
++static bool hse_start(void)
+ {
+ 	rcc_osc_on(RCC_HSE);
++	if (!dwt_enable_cycle_counter())
++		return false;
++	const uint32_t start = DWT_CYCCNT;
++	while (!rcc_is_osc_ready(RCC_HSE)) {
++		if (DWT_CYCCNT - start > HSE_STARTUP_TIMEOUT_MS * RESET_CLOCK_KHZ)
++			return rcc_is_osc_ready(RCC_HSE);
++	}
++	return true;
++}
+ 
++/*
++ * Start the 32.768kHz LSE crystal oscillator. Nothing is clocked from it, it is started so a
++ * missing or broken crystal gets noticed.
++ */
++static void crystals_start(void)
++{
+ 	/* The LSE lives in the backup domain, which is write protected after reset */
+ 	rcc_periph_clock_enable(RCC_PWR);
+ 	PWR_DBPR |= PWR_DBPR_DBP;
+@@ -201,17 +229,6 @@ static void crystals_start(void)
+ 	}
+ }
+ 
+-static bool crystal_wait_ready(const enum rcc_osc osc, const uint32_t timeout_ms)
+-{
+-	platform_timeout_s timeout;
+-	platform_timeout_set(&timeout, timeout_ms);
+-	while (!rcc_is_osc_ready(osc)) {
+-		if (platform_timeout_is_expired(&timeout))
+-			return rcc_is_osc_ready(osc);
+-	}
+-	return true;
+-}
+-
+ static bool lse_wait_ready(const uint32_t timeout_ms)
+ {
+ 	platform_timeout_s timeout;
+@@ -236,15 +253,15 @@ static void led_blink(const uint32_t count)
+ }
+ 
+ /*
+- * Check both crystals started. A failed crystal is not fatal: the LED blinks 3 times for
+- * the HSE and 2 times for the LSE, then the firmware carries on.
++ * Report crystals that did not start. A failed crystal is not fatal: the LED blinks 3 times
++ * for the HSE (SYSCLK then runs from MSIS instead) and 2 times for the LSE, then the firmware
++ * carries on.
+  */
+ static void crystals_check(void)
+ {
+-	const bool hse_ok = crystal_wait_ready(RCC_HSE, HSE_STARTUP_TIMEOUT_MS);
+ 	const bool lse_ok = lse_wait_ready(LSE_STARTUP_TIMEOUT_MS);
+ 	if (!hse_ok) {
+-		DEBUG_WARN("HSE crystal did not start\n");
++		DEBUG_WARN("HSE crystal did not start, running from MSIS\n");
+ 		led_blink(HSE_FAIL_BLINKS);
+ 	}
+ 	if (!lse_ok) {
+diff --git a/src/platforms/weact-u585/platform.h b/src/platforms/weact-u585/platform.h
+index 40b5453..c070ffd 100644
+--- a/src/platforms/weact-u585/platform.h
++++ b/src/platforms/weact-u585/platform.h
+@@ -59,7 +59,7 @@ extern bool debug_bmp;
+  * Host Interface & Misc:
+  * USB_D+    = PA12
+  * USB_D-    = PA11
+- * HSE       = PH0/PH1   (25MHz crystal)
++ * HSE       = PH0/PH1   (25MHz crystal, clocks SYSCLK through PLL1)
+  * LSE       = PC14/PC15 (32.768kHz crystal)
+  *
+  * Target Debug Interface (direct GPIO, 3.3V only):
+diff --git a/src/platforms/weact-u585/rcc_clocking.h b/src/platforms/weact-u585/rcc_clocking.h
+index 6ee8062..8be5225 100644
+--- a/src/platforms/weact-u585/rcc_clocking.h
++++ b/src/platforms/weact-u585/rcc_clocking.h
+@@ -39,11 +39,52 @@
+ #include <libopencm3/stm32/pwr.h>
+ #include <libopencm3/stm32/flash.h>
+ 
++/*
++ * The normal configuration: SYSCLK at 160MHz from PLL1 fed by the board's 25MHz HSE crystal, as in
++ * WeAct's own examples for this board. USB keeps running from HSI48 trimmed by the CRS (see platform.c).
++ */
++static struct rcc_pll_config rcc_hse_config = {
++	.sysclock_source = RCC_PLL1,
++	.hse_frequency = 25000000U,
++	/* MSIS keeps its reset range, it does not feed anything in this configuration */
++	.msis_range = RCC_MSIS_RANGE_OFF,
++	.pll1 =
++		{
++			/* PLL1 consumes the HSE */
++			.pll_source = RCC_PLLCFGR_PLLSRC_HSE,
++			/* Divide 25MHz down to 5MHz as input to get the clock in range (4-8MHz) */
++			.divm = 5U,
++			/* Multiply up to 320MHz */
++			.divn = 64U,
++			/* Make use of output R for the main system clock at 160MHz (R only divides by 1 or even) */
++			.divr = 2U,
++		},
++	.pll2 =
++		{
++			.pll_source = RCC_PLLCFGR_PLLSRC_NONE,
++			.divm = 0U,
++		},
++	.pll3 =
++		{
++			.pll_source = RCC_PLLCFGR_PLLSRC_NONE,
++			.divm = 0U,
++		},
++	/* SYSCLK is 160MHz, so no need to divide it down for AHB, APB1, APB2 or APB3 */
++	.hpre = RCC_CFGR2_HPRE_NODIV,
++	.ppre1 = RCC_PPRE_NODIV,
++	.ppre2 = RCC_PPRE_NODIV,
++	.ppre3 = RCC_PPRE_NODIV,
++	/* We aren't using DSI, so let that be at defaults */
++	.dpre = RCC_CFGR2_DPRE_DEFAULT,
++	/* Flash requires 4 wait states to access at 160MHz per RM0456 §7.3.3 Read access latency */
++	.flash_waitstates = FLASH_ACR_LATENCY_4WS,
++	/* 1.2V -> 160MHz f(max), use the LDO to power everything as we don't have a SMPS in this package */
++	.voltage_scale = PWR_VOS_SCALE_1,
++	.power_mode = PWR_SYS_LDO,
++};
++
++/* The fallback configuration when the HSE crystal does not start: SYSCLK at 160MHz from PLL1 fed by MSIS, as on BMPv3 */
+ static struct rcc_pll_config rcc_hsi_config = {
+-	/*
+-	 * Use PLL1 as our clock source, fed from MSIS exactly as on BMPv3. The board's 25MHz HSE
+-	 * crystal is started (see platform.c) but does not clock anything yet
+-	 */
+ 	.sysclock_source = RCC_PLL1,
+ 	.hse_frequency = 0U,
+ 	/* Set the MSIS up to output 48MHz, which is the 3x the max in for the PLLs */
+-- 
+2.43.0
+
